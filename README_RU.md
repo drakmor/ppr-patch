@@ -18,8 +18,8 @@ package-чтений. Native-запросы продолжают вызыват�
 > APR bind и unmount; payload не может проверить это условие самостоятельно.
 
 Подробный разбор caller и очередей находится в
-[`PPR_READ_PATHS_RU.md`](../PPR_READ_PATHS_RU.md). Английская версия —
-[`PPR_READ_PATHS.md`](../PPR_READ_PATHS.md).
+[`PPR_READ_PATHS_RU.md`](PPR_READ_PATHS_RU.md). Английская версия —
+[`PPR_READ_PATHS.md`](PPR_READ_PATHS.md).
 
 ## Состав проекта
 
