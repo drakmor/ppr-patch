@@ -18,8 +18,8 @@ mounts can alternate after one installation.
 > binds, and unmount work; the payload cannot prove that condition itself.
 
 The detailed queue and caller analysis is available in
-[`PPR_READ_PATHS.md`](../PPR_READ_PATHS.md). Its Russian version is
-[`PPR_READ_PATHS_RU.md`](../PPR_READ_PATHS_RU.md).
+[`PPR_READ_PATHS.md`](PPR_READ_PATHS.md). Its Russian version is
+[`PPR_READ_PATHS_RU.md`](PPR_READ_PATHS_RU.md).
 
 ## Contents
 
