@@ -44,9 +44,9 @@ static const uint32_t call_stock[10] = {
     0x97a8d538U, 0x97a8cb7bU,
 };
 
-#define KMB_RANGE_VA      0x06418d30ULL
-#define KMB_RANGE_STOCK   0x1a8b018bU
-#define KMB_RANGE_PATCHED 0x5280400bU
+#define FSWRITE_RANGE_VA      0x06413288ULL
+#define FSWRITE_RANGE_STOCK   0x540008c8U
+#define FSWRITE_RANGE_PATCHED 0x14000009U
 
 static uint8_t *mock_span(struct mock_a53 *mock, uint64_t pa, uint32_t size) {
     if (pa >= MOCK_LAYOUT_PA &&
@@ -106,8 +106,8 @@ static void mock_init(struct mock_a53 *mock) {
                0x35000b38U);
     mock_put32(mock, MOCK_SRAM_PA + 0x04e5a870ULL - MOCK_IO_VA,
                0x97ffeff4U);
-    mock_put32(mock, MOCK_G6_PA + KMB_RANGE_VA - MOCK_DEV_VA,
-               KMB_RANGE_STOCK);
+    mock_put32(mock, MOCK_G6_PA + FSWRITE_RANGE_VA - MOCK_DEV_VA,
+               FSWRITE_RANGE_STOCK);
 }
 
 static int mock_read(void *context, uint64_t pa, void *dst, uint32_t size) {
@@ -173,11 +173,13 @@ int main(void) {
         .mixed_io_enabled = 1,
     };
 
+    assert(ppr_patch_firmware_supported(0x01000000U));
     assert(ppr_patch_firmware_supported(0x04030000U));
     assert(ppr_patch_firmware_supported(0x07610000U));
     assert(ppr_patch_firmware_supported(0x09400000U));
     assert(ppr_patch_firmware_supported(0x09600000U));
-    assert(!ppr_patch_firmware_supported(0x09000000U));
+    assert(ppr_patch_firmware_supported(0x11400000U));
+    assert(!ppr_patch_firmware_supported(0x12000000U));
 
     assert(ppr_patch_run(&transport, 0x09400000U,
                          PPR_PATCH_STATUS, 0) == 0);
@@ -188,22 +190,26 @@ int main(void) {
     assert(mock.writes == 0);
     assert(ppr_patch_run(&transport, 0x09400000U,
                          PPR_PATCH_KMB_RANGE_INSTALL, 1) == 0);
-    assert(mock_get32(&mock, MOCK_G6_PA + KMB_RANGE_VA - MOCK_DEV_VA) ==
-           KMB_RANGE_PATCHED);
+    assert(mock_get32(&mock, MOCK_G6_PA + FSWRITE_RANGE_VA - MOCK_DEV_VA) ==
+           FSWRITE_RANGE_PATCHED);
+    unsigned writes_after_kmb_install = mock.writes;
+    assert(ppr_patch_run(&transport, 0x09400000U,
+                         PPR_PATCH_KMB_RANGE_INSTALL, 1) == 0);
+    assert(mock.writes == writes_after_kmb_install);
     for (size_t i = 0; i < 10; i++)
         assert(mock_get32(&mock, mock_site_pa(i)) == call_stock[i]);
     assert(ppr_patch_run(&transport, 0x09400000U,
                          PPR_PATCH_KMB_RANGE_UNINSTALL, 1) == 0);
-    assert(mock_get32(&mock, MOCK_G6_PA + KMB_RANGE_VA - MOCK_DEV_VA) ==
-           KMB_RANGE_STOCK);
-    mock_put32(&mock, MOCK_G6_PA + KMB_RANGE_VA - MOCK_DEV_VA,
+    assert(mock_get32(&mock, MOCK_G6_PA + FSWRITE_RANGE_VA - MOCK_DEV_VA) ==
+           FSWRITE_RANGE_STOCK);
+    mock_put32(&mock, MOCK_G6_PA + FSWRITE_RANGE_VA - MOCK_DEV_VA,
                0xdeadbeefU);
     unsigned writes_before_unknown_range = mock.writes;
     assert(ppr_patch_run(&transport, 0x09400000U,
                          PPR_PATCH_KMB_RANGE_INSTALL, 1) != 0);
     assert(mock.writes == writes_before_unknown_range);
-    mock_put32(&mock, MOCK_G6_PA + KMB_RANGE_VA - MOCK_DEV_VA,
-               KMB_RANGE_STOCK);
+    mock_put32(&mock, MOCK_G6_PA + FSWRITE_RANGE_VA - MOCK_DEV_VA,
+               FSWRITE_RANGE_STOCK);
     unsigned writes_after_range = mock.writes;
     assert(ppr_patch_run(&transport, 0x09400000U,
                          PPR_PATCH_INSTALL, 0) != 0);
@@ -234,7 +240,7 @@ int main(void) {
     assert(mock.writes == writes_before);
     assert(mock_get32(&mock, mock_site_pa(0)) == 0xdeadbeefU);
 
-    assert(ppr_patch_run(&transport, 0x09000000U,
+    assert(ppr_patch_run(&transport, 0x12000000U,
                          PPR_PATCH_STATUS, 0) != 0);
     puts("ppr_patch host state-machine tests passed");
     return 0;

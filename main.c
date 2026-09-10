@@ -51,9 +51,9 @@ static void usage(const char *program) {
     puts("  --mode plaintext-noauth --idle");
     puts("                            select FE/FF plaintext mode");
     puts("  --kmb-range-install --idle");
-    puts("                            allow ExtFs encryption slots up to 511");
+    puts("                            bypass the opcode-0x53 AES range guard");
     puts("  --kmb-range-uninstall --idle");
-    puts("                            restore the native request-class limit");
+    puts("                            restore the opcode-0x53 range guard");
     puts("transport options (read-only verified before use):");
     puts("  --fast --persistent --batch --mixed-io");
     puts("  --conservative            disable all fast transports");
@@ -141,7 +141,7 @@ int main(int argc, char **argv) {
     }
 
     const struct a53_transport_options conservative = {0, 0, 0};
-    if (a53_transport_initialize(system_firmware, &conservative) != 0)
+    if (a53_transport_initialize(&conservative) != 0)
         return 1;
 
     char version[160];

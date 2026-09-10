@@ -11,8 +11,7 @@ struct a53_transport_options {
     int mixed_io;
 };
 
-int a53_transport_initialize(uint32_t system_firmware,
-                             const struct a53_transport_options *options);
+int a53_transport_initialize(const struct a53_transport_options *options);
 int a53_transport_get_version(char *out, uint32_t out_size);
 uint32_t a53_transport_parse_release(const char *version);
 int a53_transport_verify_and_enable_fast(

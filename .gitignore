@@ -1,0 +1,7 @@
+/build/
+/__pycache__/
+/ppr_wrapper.o
+/ppr_wrapper.verified.elf
+/ppr_runtime.bin
+/ppr_plaintext.bin
+/*.plist

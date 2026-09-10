@@ -11,15 +11,14 @@ OUT ?= build
 HOST_CC ?= cc
 CFLAGS := -Wall -Wextra -Werror -O2 -g -std=c17
 SOURCES := main.c a53_transport.c notify.c ppr_patch.c
+PROFILE_INCLUDE := ppr_profiles.inc
 
 A53_ARM64_CC := $(PS5_PAYLOAD_SDK)/bin/clang
 A53_ARM64_LD := $(PS5_PAYLOAD_SDK)/bin/ld.lld
 A53_ARM64_OBJCOPY := $(PS5_PAYLOAD_SDK)/bin/llvm-objcopy
 
-PPR403_A53_ELF ?= ../../MP4_1.00-12.00/4.03_mp4/4.03_mp4/a53.elf
-PPR761_A53_ELF ?= ../../MP4_1.00-12.00/7.61_mp4/7.61_mp4/a53.elf
-PPR940_A53_ELF ?= ../../MP4_1.00-12.00/9.40_mp4/9.40_mp4/a53.elf
-PPR960_A53_ELF ?= ../../MP4_1.00-12.00/9.60_mp4/9.60_mp4/a53.elf
+PPR_FULL_ROOT ?= ../../MP4_1.00-12.00
+PPR_DRAM_ROOT ?= /mnt/j/PS5Dev/mp4
 
 PATCHER := $(OUT)/a53_ppr_patcher.elf
 INSTALL := $(OUT)/a53_ppr_install.elf
@@ -30,7 +29,7 @@ UNINSTALL := $(OUT)/a53_ppr_uninstall.elf
 KMB_RANGE_INSTALL := $(OUT)/a53_kmb_range_install.elf
 KMB_RANGE_UNINSTALL := $(OUT)/a53_kmb_range_uninstall.elf
 
-.PHONY: all verify host-test clean deploy-install-fast
+.PHONY: all profiles verify host-test clean deploy-install-fast
 
 all: verify host-test $(PATCHER) $(INSTALL) $(INSTALL_FAST) $(NATIVE) \
 	$(PLAINTEXT) $(UNINSTALL) $(KMB_RANGE_INSTALL) $(KMB_RANGE_UNINSTALL)
@@ -38,57 +37,56 @@ all: verify host-test $(PATCHER) $(INSTALL) $(INSTALL_FAST) $(NATIVE) \
 $(OUT):
 	mkdir -p $@
 
-$(PATCHER): $(SOURCES) | $(OUT)
-	$(CC) $(CFLAGS) -o $@ $^
+$(PATCHER): $(SOURCES) $(PROFILE_INCLUDE) | $(OUT)
+	$(CC) $(CFLAGS) -o $@ $(SOURCES)
 
-$(INSTALL): $(SOURCES) | $(OUT)
+$(INSTALL): $(SOURCES) $(PROFILE_INCLUDE) | $(OUT)
 	$(CC) $(CFLAGS) -DPPR_DEFAULT_ACTION=PPR_PATCH_INSTALL \
 		-DPPR_DEFAULT_IDLE_ACK=1 -DPPR_DEFAULT_BATCH=1 \
-		-DPPR_DEFAULT_PERSISTENT=1 -o $@ $^
+		-DPPR_DEFAULT_PERSISTENT=1 -o $@ $(SOURCES)
 
-$(INSTALL_FAST): $(SOURCES) | $(OUT)
+$(INSTALL_FAST): $(SOURCES) $(PROFILE_INCLUDE) | $(OUT)
 	$(CC) $(CFLAGS) -DPPR_DEFAULT_ACTION=PPR_PATCH_INSTALL \
 		-DPPR_DEFAULT_IDLE_ACK=1 -DPPR_DEFAULT_FAST=1 \
 		-DPPR_DEFAULT_BATCH=1 -DPPR_DEFAULT_PERSISTENT=1 \
-		-DPPR_DEFAULT_MIXED_IO=1 -o $@ $^
+		-DPPR_DEFAULT_MIXED_IO=1 -o $@ $(SOURCES)
 
-$(NATIVE): $(SOURCES) | $(OUT)
+$(NATIVE): $(SOURCES) $(PROFILE_INCLUDE) | $(OUT)
 	$(CC) $(CFLAGS) -DPPR_DEFAULT_ACTION=PPR_PATCH_MODE_NATIVE \
 		-DPPR_DEFAULT_IDLE_ACK=1 -DPPR_DEFAULT_BATCH=1 \
-		-DPPR_DEFAULT_PERSISTENT=1 -o $@ $^
+		-DPPR_DEFAULT_PERSISTENT=1 -o $@ $(SOURCES)
 
-$(PLAINTEXT): $(SOURCES) | $(OUT)
+$(PLAINTEXT): $(SOURCES) $(PROFILE_INCLUDE) | $(OUT)
 	$(CC) $(CFLAGS) -DPPR_DEFAULT_ACTION=PPR_PATCH_MODE_PLAINTEXT_NOAUTH \
 		-DPPR_DEFAULT_IDLE_ACK=1 -DPPR_DEFAULT_BATCH=1 \
-		-DPPR_DEFAULT_PERSISTENT=1 -o $@ $^
+		-DPPR_DEFAULT_PERSISTENT=1 -o $@ $(SOURCES)
 
-$(UNINSTALL): $(SOURCES) | $(OUT)
+$(UNINSTALL): $(SOURCES) $(PROFILE_INCLUDE) | $(OUT)
 	$(CC) $(CFLAGS) -DPPR_DEFAULT_ACTION=PPR_PATCH_UNINSTALL \
 		-DPPR_DEFAULT_IDLE_ACK=1 -DPPR_DEFAULT_BATCH=1 \
-		-DPPR_DEFAULT_PERSISTENT=1 -o $@ $^
+		-DPPR_DEFAULT_PERSISTENT=1 -o $@ $(SOURCES)
 
-$(KMB_RANGE_INSTALL): $(SOURCES) | $(OUT)
+$(KMB_RANGE_INSTALL): $(SOURCES) $(PROFILE_INCLUDE) | $(OUT)
 	$(CC) $(CFLAGS) -DPPR_DEFAULT_ACTION=PPR_PATCH_KMB_RANGE_INSTALL \
-		-DPPR_DEFAULT_IDLE_ACK=1 -DPPR_DEFAULT_BATCH=1 \
-		-DPPR_DEFAULT_PERSISTENT=1 -o $@ $^
+		-DPPR_DEFAULT_IDLE_ACK=1 -o $@ $(SOURCES)
 
-$(KMB_RANGE_UNINSTALL): $(SOURCES) | $(OUT)
+$(KMB_RANGE_UNINSTALL): $(SOURCES) $(PROFILE_INCLUDE) | $(OUT)
 	$(CC) $(CFLAGS) -DPPR_DEFAULT_ACTION=PPR_PATCH_KMB_RANGE_UNINSTALL \
-		-DPPR_DEFAULT_IDLE_ACK=1 -DPPR_DEFAULT_BATCH=1 \
-		-DPPR_DEFAULT_PERSISTENT=1 -o $@ $^
+		-DPPR_DEFAULT_IDLE_ACK=1 -o $@ $(SOURCES)
+
+profiles: generate_ppr_profiles.py
+	python3 generate_ppr_profiles.py --full-root $(PPR_FULL_ROOT) \
+		--dram-root $(PPR_DRAM_ROOT) --output $(PROFILE_INCLUDE)
 
 verify: ppr_wrapper.S ppr_wrapper.ld ppr_patch.c ppr_patch.h \
-	verify_ppr_profiles.py
+	verify_ppr_profiles.py generate_ppr_profiles.py $(PROFILE_INCLUDE)
 	python3 verify_ppr_profiles.py --host-cc $(HOST_CC) \
 		--arm-cc $(A53_ARM64_CC) --arm-ld $(A53_ARM64_LD) \
 		--objcopy $(A53_ARM64_OBJCOPY) --source ppr_patch.c \
 		--asm ppr_wrapper.S --linker ppr_wrapper.ld \
-		--elf 0x04030000=$(PPR403_A53_ELF) \
-		--elf 0x07610000=$(PPR761_A53_ELF) \
-		--elf 0x09400000=$(PPR940_A53_ELF) \
-		--elf 0x09600000=$(PPR960_A53_ELF)
+		--full-root $(PPR_FULL_ROOT) --dram-root $(PPR_DRAM_ROOT)
 
-host-test: ppr_patch.c ppr_patch.h ppr_patch_test.c
+host-test: ppr_patch.c ppr_patch.h ppr_patch_test.c $(PROFILE_INCLUDE)
 	$(HOST_CC) -std=c17 -Wall -Wextra -Werror -O1 -g \
 		-fsanitize=undefined -fno-omit-frame-pointer \
 		ppr_patch.c ppr_patch_test.c -o /tmp/a53-ppr-patch-test

@@ -42,18 +42,6 @@
 #define IOCTL_FINISH         0x8008410fU
 #define IOCTL_ALTER_STATE    0x40184115U
 
-#define K403_STATE_OFF       0x4e4ULL
-#define K403_FLAGS_OFF       0x4ecULL
-#define K403_SIZE_OFF        0x520ULL
-#define K403_IOMMU_OFF       0x528ULL
-#define K403_BUFFER_OFF      0x530ULL
-
-#define K940_STATE_OFF       0x4ecULL
-#define K940_FLAGS_OFF       0x4f4ULL
-#define K940_SIZE_OFF        0x6a8ULL
-#define K940_IOMMU_OFF       0x6b0ULL
-#define K940_BUFFER_OFF      0x6b8ULL
-
 struct deci5s_hdr {
     uint32_t magic, self_size, packet_size;
     uint32_t src, dst, protocol_id, attr, user_data;
@@ -197,7 +185,7 @@ static int find_mp4_device(void) {
     return -1;
 }
 
-static int initialize_mailbox(uint32_t firmware) {
+static int initialize_mailbox(void) {
     const char *path = "/dev/mp4/dump";
     uint64_t original_auth = swap_auth(SYSCORE_AUTH_ID);
     int result = -1;
@@ -255,41 +243,14 @@ static int initialize_mailbox(uint32_t firmware) {
     uint64_t state_slot = 0;
     uint64_t flags_slot = 0;
     uint64_t buffer_slot = 0;
-    uint64_t iommu_slot = 0;
-    uint64_t size_slot = 0;
-    if (firmware == 0x04030000U) {
-        state_slot = g_mp4sc + K403_STATE_OFF;
-        flags_slot = g_mp4sc + K403_FLAGS_OFF;
-        buffer_slot = g_mp4sc + K403_BUFFER_OFF;
-        iommu_slot = g_mp4sc + K403_IOMMU_OFF;
-        size_slot = g_mp4sc + K403_SIZE_OFF;
-    } else if (firmware == 0x09400000U) {
-        state_slot = g_mp4sc + K940_STATE_OFF;
-        flags_slot = g_mp4sc + K940_FLAGS_OFF;
-        buffer_slot = g_mp4sc + K940_BUFFER_OFF;
-        iommu_slot = g_mp4sc + K940_IOMMU_OFF;
-        size_slot = g_mp4sc + K940_SIZE_OFF;
-    }
-    if (state_slot &&
-        (((kread32(flags_slot) & 0xffffU) != 0x212U) ||
-         ((kread32(state_slot) & ~0x10U) != 0xfU))) {
-        puts("[!] exact coredump mailbox signature mismatch; scanning layout");
-        state_slot = 0;
-        flags_slot = 0;
-        buffer_slot = 0;
-        iommu_slot = 0;
-        size_slot = 0;
-    }
-    if (!state_slot) {
-        for (uint32_t offset = 8; offset < 0x1000; offset += 4) {
-            uint32_t flags = kread32(g_mp4sc + offset);
-            uint32_t state = kread32(g_mp4sc + offset - 8);
-            if ((flags & 0xffffU) == 0x212U &&
-                (state & ~0x10U) == 0xfU) {
-                state_slot = g_mp4sc + offset - 8;
-                flags_slot = g_mp4sc + offset;
-                break;
-            }
+    for (uint32_t offset = 8; offset < 0x1000; offset += 4) {
+        uint32_t flags = kread32(g_mp4sc + offset);
+        uint32_t state = kread32(g_mp4sc + offset - 8);
+        if ((flags & 0xffffU) == 0x212U &&
+            (state & ~0x10U) == 0xfU) {
+            state_slot = g_mp4sc + offset - 8;
+            flags_slot = g_mp4sc + offset;
+            break;
         }
     }
 
@@ -304,25 +265,14 @@ static int initialize_mailbox(uint32_t firmware) {
         puts("[!] coredump mailbox state/flags were not found");
         goto out;
     }
-    if (buffer_slot) {
-        uint64_t exact_buffer = kread64(buffer_slot);
-        if ((exact_buffer >> 40) != 0xffffffULL ||
-            (exact_buffer & 0xfffffULL) != 0) {
-            buffer_slot = 0;
-            iommu_slot = 0;
-            size_slot = 0;
-        }
-    }
-    if (!buffer_slot) {
-        uint64_t first = (flags_slot - g_mp4sc) / 8;
-        for (uint64_t index = first; index < 0x1000 / 8; index++) {
-            uint64_t slot = g_mp4sc + index * 8;
-            uint64_t value = kread64(slot);
-            if ((value >> 40) == 0xffffffULL &&
-                (value & 0xfffffULL) == 0) {
-                buffer_slot = slot;
-                break;
-            }
+    uint64_t first = (flags_slot - g_mp4sc) / 8;
+    for (uint64_t index = first; index < 0x1000 / 8; index++) {
+        uint64_t slot = g_mp4sc + index * 8;
+        uint64_t value = kread64(slot);
+        if ((value >> 40) == 0xffffffULL &&
+            (value & 0xfffffULL) == 0) {
+            buffer_slot = slot;
+            break;
         }
     }
     if (!buffer_slot) {
@@ -340,8 +290,8 @@ static int initialize_mailbox(uint32_t firmware) {
     g_state_addr = state_slot;
     g_flags_addr = flags_slot;
     g_buffer_slot = buffer_slot;
-    g_iommu_slot = iommu_slot ? iommu_slot : buffer_slot - 8;
-    g_size_slot = size_slot ? size_slot : buffer_slot - 16;
+    g_iommu_slot = buffer_slot - 8;
+    g_size_slot = buffer_slot - 16;
     g_initialized = 1;
     printf("[+] state=0x%lx flags=0x%lx buf=0x%lx\n",
            (unsigned long)g_state_addr,
@@ -809,8 +759,7 @@ static uint64_t callback_ticks(void *context) {
     return g_elapsed_ticks;
 }
 
-int a53_transport_initialize(uint32_t system_firmware,
-                             const struct a53_transport_options *options) {
+int a53_transport_initialize(const struct a53_transport_options *options) {
     if (!options)
         return -1;
     g_persistent = options->persistent;
@@ -818,7 +767,7 @@ int a53_transport_initialize(uint32_t system_firmware,
     g_mixed_io = options->mixed_io;
     if (find_mp4_device() != 0)
         return -1;
-    return initialize_mailbox(system_firmware);
+    return initialize_mailbox();
 }
 
 int a53_transport_get_version(char *out, uint32_t out_size) {

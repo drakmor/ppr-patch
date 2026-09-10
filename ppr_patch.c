@@ -7,8 +7,8 @@
 
 #define PPR_CALL_COUNT 10U
 #define PPR_SITE_COUNT (PPR_CALL_COUNT + 2U)
-#define PPR_RUNTIME_SIZE 0x48U
-#define PPR_PLAINTEXT_SIZE 0x98U
+#define PPR_RUNTIME_SIZE 0x4cU
+#define PPR_PLAINTEXT_SIZE 0xa0U
 #define PPR_LAYOUT_HEADER_SIZE 0x148U
 #define PPR_LAYOUT_MAX_SEGMENTS 32U
 
@@ -33,6 +33,14 @@ struct ppr_profile {
     uint32_t firmware;
     const char *name;
 
+    enum {
+        PPR_ABI_LEGACY,
+        PPR_ABI_CURRENT,
+        PPR_ABI_LATE,
+    } abi;
+    int merged_text;
+    int cave_in_dev;
+
     uint64_t io_mapped_base;
     uint64_t io_file_size;
     uint64_t io_mapped_size;
@@ -54,14 +62,16 @@ struct ppr_profile {
     uint64_t common_return_va;
 
     /*
-     * ExtFs_EncryptAndCalculateSha validates its XTS/CMAC allocation against
-     * a limit selected from the request class: 112 for the restricted class,
-     * otherwise the full 9-bit KMB aperture (512).  Replace only that CSEL
-     * with a MOV of 512; the XTS pair-size and CMAC range checks stay native.
+     * FlashWriteEncryptAndCalculateSha (opcode 0x53) has a second, unrelated
+     * whitelist for the 8-bit AES base index encoded in its command header.
+     * Redirect only the out-of-range rejection to the native success path;
+     * the stock per-index filter inside its original range remains intact.
+     * The command format still limits AES/SHA indices to 0..255 and callers
+     * must keep the AES-XTS pair within that aperture.
      */
-    uint64_t encrypt_kmb_range_va;
-    uint32_t encrypt_kmb_range_stock;
-    uint32_t encrypt_kmb_range_patch;
+    uint64_t fswrite_kmb_range_va;
+    uint32_t fswrite_kmb_range_stock;
+    uint32_t fswrite_kmb_range_patch;
 
     uint64_t call_va[PPR_CALL_COUNT];
     uint32_t call_stock[PPR_CALL_COUNT];
@@ -71,163 +81,8 @@ struct ppr_profile {
     uint32_t dispatch_stock;
 };
 
-/*
- * The four profiles were checked against the corresponding A53 ELFs in IDA.
- * In every image the common helper has the same 18-argument ABI, saves the
- * same registers, stores the terminal SHA notification at [x29-0xc], and
- * reaches its native dispatch at helper+0x1b4.  IdmaPt and the queue-submit
- * helper also have matching ABIs and data-structure offsets.
- */
-static const struct ppr_profile ppr_profiles[] = {
-    {
-        .firmware = 0x04030000U, .name = "4.03",
-        .io_mapped_base = 0x04e27000ULL,
-        .io_file_size = 0x376d4ULL, .io_mapped_size = 0x38000ULL,
-        .io_sram_base = 0x27000ULL,
-        .dev_mapped_base = 0x06410000ULL,
-        .dev_file_size = 0x2ecf8ULL, .dev_mapped_size = 0x2f000ULL,
-        .runtime_cave_va = 0x04e5ef00ULL,
-        .plaintext_cave_va = 0x04e5ef50ULL,
-        .helper_va = 0x04e5c334ULL,
-        .precheck_normal_va = 0x04e5c3b4ULL,
-        .precheck_special_va = 0x04e5c3e8ULL,
-        .common_error_va = 0x04e5c514ULL,
-        .dispatch_native_va = 0x04e584c8ULL,
-        .plaintext_idma_va = 0x04e58f88ULL,
-        .sha_wait_idma_aes_va = 0x04e5941cULL,
-        .submit_idma_va = 0x04e57008ULL,
-        .common_return_va = 0x04e5c624ULL,
-        .encrypt_kmb_range_va = 0x06417b68ULL,
-        .encrypt_kmb_range_stock = 0x1a8e01edU,
-        .encrypt_kmb_range_patch = 0x5280400dU,
-        .call_va = {
-            0x04e49418ULL, 0x04e49b5cULL, 0x06413e2cULL,
-            0x06414ff0ULL, 0x06415280ULL, 0x06415514ULL,
-            0x06416aecULL, 0x06421224ULL, 0x064231a8ULL,
-            0x064256d8ULL,
-        },
-        .call_stock = {
-            0x94004bc7U, 0x940049f6U, 0x97a92142U, 0x97a91cd1U,
-            0x97a91c2dU, 0x97a91b88U, 0x97a91612U, 0x97a8ec44U,
-            0x97a8e463U, 0x97a8db17U,
-        },
-        .precheck_va = 0x04e5c3b0ULL,
-        .precheck_stock = 0x35000b38U,
-        .dispatch_va = 0x04e5c4e8ULL,
-        .dispatch_stock = 0x97ffeff8U,
-    },
-    {
-        .firmware = 0x07610000U, .name = "7.61",
-        .io_mapped_base = 0x04e27000ULL,
-        .io_file_size = 0x35138ULL, .io_mapped_size = 0x36000ULL,
-        .io_sram_base = 0x27000ULL,
-        .dev_mapped_base = 0x06411000ULL,
-        .dev_file_size = 0x31a80ULL, .dev_mapped_size = 0x32000ULL,
-        .runtime_cave_va = 0x04e5cf00ULL,
-        .plaintext_cave_va = 0x04e5cf50ULL,
-        .helper_va = 0x04e59da0ULL,
-        .precheck_normal_va = 0x04e59e20ULL,
-        .precheck_special_va = 0x04e59e54ULL,
-        .common_error_va = 0x04e59f80ULL,
-        .dispatch_native_va = 0x04e55f24ULL,
-        .plaintext_idma_va = 0x04e569e4ULL,
-        .sha_wait_idma_aes_va = 0x04e56e78ULL,
-        .submit_idma_va = 0x04e54a38ULL,
-        .common_return_va = 0x04e5a090ULL,
-        .encrypt_kmb_range_va = 0x06418e18ULL,
-        .encrypt_kmb_range_stock = 0x1a8b018bU,
-        .encrypt_kmb_range_patch = 0x5280400bU,
-        .call_va = {
-            0x04e480d4ULL, 0x04e48980ULL, 0x06415004ULL,
-            0x06416200ULL, 0x06416490ULL, 0x06416724ULL,
-            0x06417d38ULL, 0x064230d8ULL, 0x06425130ULL,
-            0x064277f0ULL,
-        },
-        .call_stock = {
-            0x94004733U, 0x94004508U, 0x97a91367U, 0x97a90ee8U,
-            0x97a90e44U, 0x97a90d9fU, 0x97a9081aU, 0x97a8db32U,
-            0x97a8d31cU, 0x97a8c96cU,
-        },
-        .precheck_va = 0x04e59e1cULL,
-        .precheck_stock = 0x35000b38U,
-        .dispatch_va = 0x04e59f54ULL,
-        .dispatch_stock = 0x97ffeff4U,
-    },
-    {
-        .firmware = 0x09400000U, .name = "9.40",
-        .io_mapped_base = 0x04e27000ULL,
-        .io_file_size = 0x35a54ULL, .io_mapped_size = 0x36000ULL,
-        .io_sram_base = 0x27000ULL,
-        .dev_mapped_base = 0x06411000ULL,
-        .dev_file_size = 0x32e00ULL, .dev_mapped_size = 0x33000ULL,
-        .runtime_cave_va = 0x04e5cf00ULL,
-        .plaintext_cave_va = 0x04e5cf50ULL,
-        .helper_va = 0x04e5a6bcULL,
-        .precheck_normal_va = 0x04e5a73cULL,
-        .precheck_special_va = 0x04e5a770ULL,
-        .common_error_va = 0x04e5a89cULL,
-        .dispatch_native_va = 0x04e56840ULL,
-        .plaintext_idma_va = 0x04e57300ULL,
-        .sha_wait_idma_aes_va = 0x04e57794ULL,
-        .submit_idma_va = 0x04e55348ULL,
-        .common_return_va = 0x04e5a9acULL,
-        .encrypt_kmb_range_va = 0x06418d30ULL,
-        .encrypt_kmb_range_stock = 0x1a8b018bU,
-        .encrypt_kmb_range_patch = 0x5280400bU,
-        .call_va = {
-            0x04e4879cULL, 0x04e49048ULL, 0x06414f1cULL,
-            0x06416118ULL, 0x064163a8ULL, 0x0641663cULL,
-            0x06417c50ULL, 0x0642313cULL, 0x064251dcULL,
-            0x064278d0ULL,
-        },
-        .call_stock = {
-            0x940047c8U, 0x9400459dU, 0x97a915e8U, 0x97a91169U,
-            0x97a910c5U, 0x97a91020U, 0x97a90a9bU, 0x97a8dd60U,
-            0x97a8d538U, 0x97a8cb7bU,
-        },
-        .precheck_va = 0x04e5a738ULL,
-        .precheck_stock = 0x35000b38U,
-        .dispatch_va = 0x04e5a870ULL,
-        .dispatch_stock = 0x97ffeff4U,
-    },
-    {
-        .firmware = 0x09600000U, .name = "9.60",
-        .io_mapped_base = 0x04e27000ULL,
-        .io_file_size = 0x35a54ULL, .io_mapped_size = 0x36000ULL,
-        .io_sram_base = 0x27000ULL,
-        .dev_mapped_base = 0x06411000ULL,
-        .dev_file_size = 0x32e00ULL, .dev_mapped_size = 0x33000ULL,
-        .runtime_cave_va = 0x04e5cf00ULL,
-        .plaintext_cave_va = 0x04e5cf50ULL,
-        .helper_va = 0x04e5a6bcULL,
-        .precheck_normal_va = 0x04e5a73cULL,
-        .precheck_special_va = 0x04e5a770ULL,
-        .common_error_va = 0x04e5a89cULL,
-        .dispatch_native_va = 0x04e56840ULL,
-        .plaintext_idma_va = 0x04e57300ULL,
-        .sha_wait_idma_aes_va = 0x04e57794ULL,
-        .submit_idma_va = 0x04e55348ULL,
-        .common_return_va = 0x04e5a9acULL,
-        .encrypt_kmb_range_va = 0x06418d30ULL,
-        .encrypt_kmb_range_stock = 0x1a8b018bU,
-        .encrypt_kmb_range_patch = 0x5280400bU,
-        .call_va = {
-            0x04e4879cULL, 0x04e49048ULL, 0x06414f1cULL,
-            0x06416118ULL, 0x064163a8ULL, 0x0641663cULL,
-            0x06417c50ULL, 0x0642313cULL, 0x064251dcULL,
-            0x064278d0ULL,
-        },
-        .call_stock = {
-            0x940047c8U, 0x9400459dU, 0x97a915e8U, 0x97a91169U,
-            0x97a910c5U, 0x97a91020U, 0x97a90a9bU, 0x97a8dd60U,
-            0x97a8d538U, 0x97a8cb7bU,
-        },
-        .precheck_va = 0x04e5a738ULL,
-        .precheck_stock = 0x35000b38U,
-        .dispatch_va = 0x04e5a870ULL,
-        .dispatch_stock = 0x97ffeff4U,
-    },
-};
+/* Generated from the complete MP4 A53 ELF set. */
+#include "ppr_profiles.inc"
 
 static const char *const ppr_call_names[PPR_CALL_COUNT] = {
     "PackageRead call 1",
@@ -251,14 +106,14 @@ struct ppr_images {
 struct ppr_resolved {
     uint64_t runtime_cave;
     uint64_t plaintext_cave;
-    uint64_t encrypt_kmb_range;
+    uint64_t fswrite_kmb_range;
     uint64_t site[PPR_SITE_COUNT];
 };
 
 struct ppr_state {
     uint8_t runtime[PPR_RUNTIME_SIZE];
     uint8_t plaintext[PPR_PLAINTEXT_SIZE];
-    uint32_t encrypt_kmb_range;
+    uint32_t fswrite_kmb_range;
     uint32_t site[PPR_SITE_COUNT];
     int runtime_exact;
     int plaintext_exact;
@@ -268,9 +123,9 @@ struct ppr_state {
     int native;
     int dynamic;
     int recoverable;
-    int encrypt_kmb_range_known;
-    int encrypt_kmb_range_stock;
-    int encrypt_kmb_range_patched;
+    int fswrite_kmb_range_known;
+    int fswrite_kmb_range_stock;
+    int fswrite_kmb_range_patched;
 };
 
 struct ppr_context {
@@ -324,12 +179,13 @@ static int ppr_encode_imm19(uint32_t instruction, uint64_t from, uint64_t to,
 
 static int ppr_build_images(struct ppr_context *ctx) {
     const struct ppr_profile *p = ctx->profile;
+    int far = p->cave_in_dev && !p->merged_text;
 
     static const uint32_t runtime_template[PPR_RUNTIME_SIZE / 4U] = {
         0x394063f0U, 0x7103fe1fU, 0x54000080U, 0xd503201fU,
         0xd503201fU, 0U, 0x52800ff0U, 0xb90013f0U, 0U,
         0x35000058U, 0U, 0x7101ff1fU, 0x54000041U, 0U, 0U,
-        0x7101ff1fU, 0U, 0U,
+        0x7101ff1fU, 0U, 0U, 0U,
     };
     static const uint32_t plaintext_template[PPR_PLAINTEXT_SIZE / 4U] = {
         0U, 0xd360ff50U, 0U, 0x2a0403e3U,
@@ -343,9 +199,51 @@ static int ppr_build_images(struct ppr_context *ctx) {
         0U, 0xaa1303e0U, 0x2a1f03e1U, 0U,
         0x2a1f03e0U, 0U,
     };
+    static const uint32_t legacy_far_template[PPR_PLAINTEXT_SIZE / 4U] = {
+        0x34000054U, 0U, 0xd360ff50U, 0xb5000050U,
+        0U, 0x2a0403e3U, 0xaa1a03e4U, 0x2a0603e5U,
+        0x2a1703e6U, 0x52800027U, 0xf90003f9U, 0U,
+        0x35000060U, 0x52a02000U, 0U, 0xaa1303e0U,
+        0xaa1603e1U, 0xb85ac3a2U, 0xaa1903e3U, 0U,
+        0x8b374a68U, 0xb9452509U, 0xb944fe6aU, 0x6b09015fU,
+        0x1a89a149U, 0x11066929U, 0xb904fe69U, 0xb905b509U,
+        0x394c226aU, 0x6b0a02ffU, 0x54000042U, 0xb9058509U,
+        0xaa1303e0U, 0x52800021U, 0U, 0xaa1303e0U,
+        0x2a1f03e1U, 0U, 0x2a1f03e0U, 0U,
+    };
     memcpy(ctx->images.runtime, runtime_template, sizeof(runtime_template));
-    memcpy(ctx->images.plaintext, plaintext_template,
-           sizeof(plaintext_template));
+    memcpy(ctx->images.plaintext,
+           far ? legacy_far_template : plaintext_template,
+           sizeof(ctx->images.plaintext));
+
+    if (far && p->abi != PPR_ABI_LEGACY)
+        return -1;
+    if (p->abi == PPR_ABI_LATE) {
+        ctx->images.runtime[9] = 0x3500005cU;  /* cbnz w28 */
+        ctx->images.runtime[11] = 0x7101ff9fU; /* cmp w28, #0x7f */
+        ctx->images.runtime[15] = 0x7101ff9fU;
+        ctx->images.plaintext[1] = 0xd360fcd0U; /* lsr x16, x6, #32 */
+        ctx->images.plaintext[4] = 0xaa0603e4U; /* mov x4, x6 */
+        ctx->images.plaintext[5] = 0x2a0603e5U; /* mov w5, w6 */
+        ctx->images.plaintext[8] = 0xf90003f6U; /* str x22, [sp] */
+        ctx->images.plaintext[14] = 0xaa1a03e1U; /* mov x1, x26 */
+        ctx->images.plaintext[16] = 0xaa1603e3U; /* mov x3, x22 */
+        ctx->images.plaintext[18] = 0xaa1903e8U; /* mov x8, x25 */
+    } else if (p->abi == PPR_ABI_LEGACY && !far) {
+        ctx->images.plaintext[5] = 0x2a0603e5U; /* mov w5, w6 */
+        ctx->images.plaintext[8] = 0xf90003f9U; /* str x25, [sp] */
+        ctx->images.plaintext[15] = 0xb85ac3a2U; /* ldur w2, [x29, #-0x54] */
+        ctx->images.plaintext[16] = 0xaa1903e3U; /* mov x3, x25 */
+        ctx->images.plaintext[18] = 0x8b374a68U; /* queue pointer */
+        if (p->merged_text) {
+            ctx->images.plaintext[19] = 0xb94a3909U;
+            ctx->images.plaintext[20] = 0xb949f66aU;
+            ctx->images.plaintext[24] = 0xb909f669U;
+            ctx->images.plaintext[25] = 0xb90ac909U;
+            ctx->images.plaintext[26] = 0x3950226aU;
+            ctx->images.plaintext[29] = 0xb90a9909U;
+        }
+    }
 
 #define B26(array, base, index, opcode, target)                                \
     do {                                                                        \
@@ -372,27 +270,52 @@ static int ppr_build_images(struct ppr_context *ctx) {
         0x14000000U, p->precheck_normal_va);
     B26(ctx->images.runtime, p->runtime_cave_va, 14,
         0x14000000U, p->common_error_va);
-    I19(ctx->images.runtime, p->runtime_cave_va, 16,
-        0x54000001U, p->dispatch_native_va);
-    B26(ctx->images.runtime, p->runtime_cave_va, 17,
-        0x14000000U, p->plaintext_cave_va);
+    if (far) {
+        ctx->images.runtime[16] = 0x54000040U; /* b.eq runtime + 0x48 */
+        B26(ctx->images.runtime, p->runtime_cave_va, 17,
+            0x14000000U, p->dispatch_native_va);
+        B26(ctx->images.runtime, p->runtime_cave_va, 18,
+            0x14000000U, p->plaintext_cave_va);
 
-    I19(ctx->images.plaintext, p->plaintext_cave_va, 0,
-        0x35000014U, p->common_error_va);
-    I19(ctx->images.plaintext, p->plaintext_cave_va, 2,
-        0xb4000010U, p->common_error_va);
-    B26(ctx->images.plaintext, p->plaintext_cave_va, 9,
-        0x94000000U, p->plaintext_idma_va);
-    B26(ctx->images.plaintext, p->plaintext_cave_va, 12,
-        0x14000000U, p->common_return_va);
-    B26(ctx->images.plaintext, p->plaintext_cave_va, 17,
-        0x94000000U, p->sha_wait_idma_aes_va);
-    B26(ctx->images.plaintext, p->plaintext_cave_va, 32,
-        0x94000000U, p->submit_idma_va);
-    B26(ctx->images.plaintext, p->plaintext_cave_va, 35,
-        0x94000000U, p->submit_idma_va);
-    B26(ctx->images.plaintext, p->plaintext_cave_va, 37,
-        0x14000000U, p->common_return_va);
+        B26(ctx->images.plaintext, p->plaintext_cave_va, 1,
+            0x14000000U, p->common_error_va);
+        B26(ctx->images.plaintext, p->plaintext_cave_va, 4,
+            0x14000000U, p->common_error_va);
+        B26(ctx->images.plaintext, p->plaintext_cave_va, 11,
+            0x94000000U, p->plaintext_idma_va);
+        B26(ctx->images.plaintext, p->plaintext_cave_va, 14,
+            0x14000000U, p->common_return_va);
+        B26(ctx->images.plaintext, p->plaintext_cave_va, 19,
+            0x94000000U, p->sha_wait_idma_aes_va);
+        B26(ctx->images.plaintext, p->plaintext_cave_va, 34,
+            0x94000000U, p->submit_idma_va);
+        B26(ctx->images.plaintext, p->plaintext_cave_va, 37,
+            0x94000000U, p->submit_idma_va);
+        B26(ctx->images.plaintext, p->plaintext_cave_va, 39,
+            0x14000000U, p->common_return_va);
+    } else {
+        I19(ctx->images.runtime, p->runtime_cave_va, 16,
+            0x54000001U, p->dispatch_native_va);
+        B26(ctx->images.runtime, p->runtime_cave_va, 17,
+            0x14000000U, p->plaintext_cave_va);
+
+        I19(ctx->images.plaintext, p->plaintext_cave_va, 0,
+            0x35000014U, p->common_error_va);
+        I19(ctx->images.plaintext, p->plaintext_cave_va, 2,
+            0xb4000010U, p->common_error_va);
+        B26(ctx->images.plaintext, p->plaintext_cave_va, 9,
+            0x94000000U, p->plaintext_idma_va);
+        B26(ctx->images.plaintext, p->plaintext_cave_va, 12,
+            0x14000000U, p->common_return_va);
+        B26(ctx->images.plaintext, p->plaintext_cave_va, 17,
+            0x94000000U, p->sha_wait_idma_aes_va);
+        B26(ctx->images.plaintext, p->plaintext_cave_va, 32,
+            0x94000000U, p->submit_idma_va);
+        B26(ctx->images.plaintext, p->plaintext_cave_va, 35,
+            0x94000000U, p->submit_idma_va);
+        B26(ctx->images.plaintext, p->plaintext_cave_va, 37,
+            0x14000000U, p->common_return_va);
+    }
 
     for (size_t i = 0; i < PPR_CALL_COUNT; i++) {
         if (ppr_encode_branch26(0x94000000U, p->call_va[i],
@@ -462,12 +385,27 @@ static int ppr_read_layout(const struct ppr_context *ctx,
         goto out;
     }
 
-    int have_io = 0, have_dev = 0;
+    const struct ppr_profile *p = ctx->profile;
+    int have_io = p->merged_text, have_dev = 0;
     for (uint32_t i = 0; i < segment_count; i++) {
-        if (records[i].id == 3) {
+        if (!p->merged_text && records[i].flags == 0x00030001U &&
+            records[i].g6_base != 0 &&
+            (records[i].g6_base & 0xfffU) == 0 &&
+            records[i].g6_size == p->io_file_size &&
+            records[i].sram_base == p->io_sram_base &&
+            records[i].sram_size >= p->io_mapped_size &&
+            records[i].mapped_base == p->io_mapped_base &&
+            records[i].mapped_size == p->io_mapped_size) {
             *io = records[i];
             have_io = 1;
-        } else if (records[i].id == 11) {
+        }
+        if (records[i].flags == 0x00010011U &&
+            records[i].g6_base != 0 &&
+            (records[i].g6_base & 0xfffU) == 0 &&
+            records[i].g6_size == p->dev_file_size &&
+            records[i].sram_base == 0 && records[i].sram_size == 0 &&
+            records[i].mapped_base == p->dev_mapped_base &&
+            records[i].mapped_size == p->dev_mapped_size) {
             *dev = records[i];
             have_dev = 1;
         }
@@ -475,24 +413,6 @@ static int ppr_read_layout(const struct ppr_context *ctx,
     if (!have_io || !have_dev)
         goto out;
 
-    const struct ppr_profile *p = ctx->profile;
-    if (io->flags != 0x00030001U ||
-        io->g6_base == 0 || (io->g6_base & 0xfffU) != 0 ||
-        io->g6_size != p->io_file_size ||
-        io->sram_base != p->io_sram_base ||
-        io->sram_size < p->io_mapped_size ||
-        io->mapped_base != p->io_mapped_base ||
-        io->mapped_size != p->io_mapped_size ||
-        dev->flags != 0x00010011U ||
-        dev->g6_base == 0 || (dev->g6_base & 0xfffU) != 0 ||
-        dev->g6_size != p->dev_file_size ||
-        dev->sram_base != 0 || dev->sram_size != 0 ||
-        dev->mapped_base != p->dev_mapped_base ||
-        dev->mapped_size != p->dev_mapped_size) {
-        ppr_logf(ctx, "[!] live A53 segment layout differs from the exact %s profile",
-                 p->name);
-        goto out;
-    }
     rc = 0;
 
 out:
@@ -525,6 +445,16 @@ static int ppr_map_g6(const struct ppr_layout_record *segment, uint64_t va,
     return 0;
 }
 
+static int ppr_map_g6_padding(const struct ppr_layout_record *segment,
+                              uint64_t va, uint32_t size, uint64_t *pa) {
+    if (!segment || !pa || segment->g6_base == 0 ||
+        va < segment->mapped_base || size > segment->mapped_size ||
+        va - segment->mapped_base > segment->mapped_size - size)
+        return -1;
+    *pa = segment->g6_base + (va - segment->mapped_base);
+    return 0;
+}
+
 static int ppr_resolve(const struct ppr_context *ctx,
                        struct ppr_resolved *resolved) {
     struct ppr_layout_record io = {0}, dev = {0};
@@ -534,18 +464,27 @@ static int ppr_resolve(const struct ppr_context *ctx,
         return -1;
     }
 
-    if (ppr_map_sram(&io, p->runtime_cave_va, PPR_RUNTIME_SIZE,
-                     &resolved->runtime_cave) != 0 ||
-        ppr_map_sram(&io, p->plaintext_cave_va, PPR_PLAINTEXT_SIZE,
-                     &resolved->plaintext_cave) != 0 ||
-        ppr_map_g6(&dev, p->encrypt_kmb_range_va, 4,
-                   &resolved->encrypt_kmb_range) != 0)
+    const struct ppr_layout_record *cave = p->cave_in_dev ? &dev : &io;
+    int runtime_mapped = p->cave_in_dev
+        ? ppr_map_g6_padding(cave, p->runtime_cave_va, PPR_RUNTIME_SIZE,
+                             &resolved->runtime_cave)
+        : ppr_map_sram(cave, p->runtime_cave_va, PPR_RUNTIME_SIZE,
+                       &resolved->runtime_cave);
+    int plaintext_mapped = p->cave_in_dev
+        ? ppr_map_g6_padding(cave, p->plaintext_cave_va, PPR_PLAINTEXT_SIZE,
+                             &resolved->plaintext_cave)
+        : ppr_map_sram(cave, p->plaintext_cave_va, PPR_PLAINTEXT_SIZE,
+                       &resolved->plaintext_cave);
+    if (runtime_mapped != 0 || plaintext_mapped != 0 ||
+        (p->fswrite_kmb_range_va != 0 &&
+         ppr_map_g6(&dev, p->fswrite_kmb_range_va, 4,
+                    &resolved->fswrite_kmb_range) != 0))
         return -1;
 
     for (size_t i = 0; i < PPR_CALL_COUNT; i++) {
         const struct ppr_layout_record *segment =
-            i < 2 ? &io : &dev;
-        int mapped = i < 2
+            !p->merged_text && i < 2 ? &io : &dev;
+        int mapped = !p->merged_text && i < 2
             ? ppr_map_sram(segment, p->call_va[i], 4,
                            &resolved->site[i])
             : ppr_map_g6(segment, p->call_va[i], 4,
@@ -556,17 +495,30 @@ static int ppr_resolve(const struct ppr_context *ctx,
             return -1;
         }
     }
-    if (ppr_map_sram(&io, p->precheck_va, 4,
-                     &resolved->site[PPR_CALL_COUNT]) != 0 ||
-        ppr_map_sram(&io, p->dispatch_va, 4,
-                     &resolved->site[PPR_CALL_COUNT + 1U]) != 0)
+    int precheck_mapped = p->merged_text
+        ? ppr_map_g6(&dev, p->precheck_va, 4,
+                     &resolved->site[PPR_CALL_COUNT])
+        : ppr_map_sram(&io, p->precheck_va, 4,
+                       &resolved->site[PPR_CALL_COUNT]);
+    int dispatch_mapped = p->merged_text
+        ? ppr_map_g6(&dev, p->dispatch_va, 4,
+                     &resolved->site[PPR_CALL_COUNT + 1U])
+        : ppr_map_sram(&io, p->dispatch_va, 4,
+                       &resolved->site[PPR_CALL_COUNT + 1U]);
+    if (precheck_mapped != 0 || dispatch_mapped != 0)
         return -1;
 
     ppr_logf(ctx, "[+] PPR %s addresses resolved from exact runtime layout",
              p->name);
-    ppr_logf(ctx, "[*] IO fixed code: executable SRAM base 0x%lx, mapped VA 0x%lx",
-             (unsigned long)io.sram_base,
-             (unsigned long)io.mapped_base);
+    if (p->merged_text) {
+        ppr_logf(ctx, "[*] merged DEV code: G6 base 0x%lx, mapped VA 0x%lx",
+                 (unsigned long)dev.g6_base,
+                 (unsigned long)dev.mapped_base);
+    } else {
+        ppr_logf(ctx, "[*] IO fixed code: executable SRAM base 0x%lx, mapped VA 0x%lx",
+                 (unsigned long)io.sram_base,
+                 (unsigned long)io.mapped_base);
+    }
     return 0;
 }
 
@@ -576,6 +528,41 @@ static uint32_t ppr_stock_site(const struct ppr_profile *p, size_t index) {
     if (index == PPR_CALL_COUNT)
         return p->precheck_stock;
     return p->dispatch_stock;
+}
+
+static int ppr_kmb_supported(const struct ppr_context *ctx) {
+    return ctx->profile->fswrite_kmb_range_va != 0;
+}
+
+static void ppr_classify_kmb_state(const struct ppr_context *ctx,
+                                   struct ppr_state *state) {
+    if (!ppr_kmb_supported(ctx)) {
+        state->fswrite_kmb_range_known = 1;
+        state->fswrite_kmb_range_stock = 1;
+        return;
+    }
+    state->fswrite_kmb_range_stock = state->fswrite_kmb_range ==
+                                     ctx->profile->fswrite_kmb_range_stock;
+    state->fswrite_kmb_range_patched = state->fswrite_kmb_range ==
+                                       ctx->profile->fswrite_kmb_range_patch;
+    state->fswrite_kmb_range_known = state->fswrite_kmb_range_stock ||
+                                     state->fswrite_kmb_range_patched;
+}
+
+static int ppr_read_kmb_state(const struct ppr_context *ctx,
+                              const struct ppr_resolved *resolved,
+                              struct ppr_state *state) {
+    memset(state, 0, sizeof(*state));
+    /*
+     * Keep the mutation payload on scalar transactions.  Besides avoiding a
+     * full unrelated selector-state read, this never emits the 16-command
+     * SDBGP packet used by the general status path.
+     */
+    if (ppr_read(ctx, resolved->fswrite_kmb_range,
+                 &state->fswrite_kmb_range, 4) != 0)
+        return -1;
+    ppr_classify_kmb_state(ctx, state);
+    return 0;
 }
 
 static int ppr_read_state(const struct ppr_context *ctx,
@@ -598,8 +585,9 @@ static int ppr_read_state(const struct ppr_context *ctx,
         STATE_READ(resolved->runtime_cave, PPR_RUNTIME_SIZE, state->runtime);
         STATE_READ(resolved->plaintext_cave, PPR_PLAINTEXT_SIZE,
                    state->plaintext);
-        STATE_READ(resolved->encrypt_kmb_range, 4,
-                   &state->encrypt_kmb_range);
+        if (ppr_kmb_supported(ctx))
+            STATE_READ(resolved->fswrite_kmb_range, 4,
+                       &state->fswrite_kmb_range);
         for (size_t i = 0; i < PPR_SITE_COUNT; i++)
             STATE_READ(resolved->site[i], 4, &state->site[i]);
 #undef STATE_READ
@@ -611,8 +599,9 @@ static int ppr_read_state(const struct ppr_context *ctx,
                      sizeof(state->runtime)) != 0 ||
             ppr_read(ctx, resolved->plaintext_cave, state->plaintext,
                      sizeof(state->plaintext)) != 0 ||
-            ppr_read(ctx, resolved->encrypt_kmb_range,
-                     &state->encrypt_kmb_range, 4) != 0)
+            (ppr_kmb_supported(ctx) &&
+             ppr_read(ctx, resolved->fswrite_kmb_range,
+                      &state->fswrite_kmb_range, 4) != 0))
             return -1;
         for (size_t i = 0; i < PPR_SITE_COUNT; i++) {
             if (ppr_read(ctx, resolved->site[i], &state->site[i], 4) != 0)
@@ -643,13 +632,34 @@ static int ppr_read_state(const struct ppr_context *ctx,
     state->recoverable = !state->native && !state->dynamic &&
                          state->runtime_exact && state->plaintext_exact &&
                          state->sites_known;
-    state->encrypt_kmb_range_stock =
-        state->encrypt_kmb_range == ctx->profile->encrypt_kmb_range_stock;
-    state->encrypt_kmb_range_patched =
-        state->encrypt_kmb_range == ctx->profile->encrypt_kmb_range_patch;
-    state->encrypt_kmb_range_known = state->encrypt_kmb_range_stock ||
-                                     state->encrypt_kmb_range_patched;
+    ppr_classify_kmb_state(ctx, state);
     return 0;
+}
+
+static int ppr_kmb_state_known(const struct ppr_state *state) {
+    return state->fswrite_kmb_range_known;
+}
+
+static int ppr_kmb_state_stock(const struct ppr_state *state) {
+    return state->fswrite_kmb_range_stock;
+}
+
+static int ppr_kmb_state_patched(const struct ppr_state *state) {
+    return state->fswrite_kmb_range_patched;
+}
+
+static void ppr_print_kmb_state(const struct ppr_context *ctx,
+                                const struct ppr_state *state) {
+    if (!ppr_kmb_supported(ctx))
+        return;
+    if (ppr_kmb_state_patched(state)) {
+        ppr_logf(ctx, "[+] FsWrite opcode 0x53 KMB range guard: BYPASSED");
+    } else if (ppr_kmb_state_stock(state)) {
+        ppr_logf(ctx, "[*] FsWrite opcode 0x53 KMB range guard: STOCK");
+    } else {
+        ppr_logf(ctx, "[!] FsWrite opcode 0x53 KMB range guard: UNKNOWN (%08x)",
+                 state->fswrite_kmb_range);
+    }
 }
 
 static void ppr_print_state(const struct ppr_context *ctx,
@@ -671,14 +681,7 @@ static void ppr_print_state(const struct ppr_context *ctx,
                  state->site[PPR_CALL_COUNT],
                  state->site[PPR_CALL_COUNT + 1U]);
     }
-    if (state->encrypt_kmb_range_patched) {
-        ppr_logf(ctx, "[+] encryption KMB aperture: EXTENDED (upper bound 512; lower bound retained)");
-    } else if (state->encrypt_kmb_range_stock) {
-        ppr_logf(ctx, "[*] encryption KMB aperture: STOCK (request-class limit)");
-    } else {
-        ppr_logf(ctx, "[!] encryption KMB aperture: UNKNOWN (%08x)",
-                 state->encrypt_kmb_range);
-    }
+    ppr_print_kmb_state(ctx, state);
 }
 
 static int ppr_write_checked(const struct ppr_context *ctx, uint64_t pa,
@@ -781,6 +784,45 @@ static void ppr_print_stats(const struct ppr_context *ctx) {
              (unsigned long)ticks);
 }
 
+static int ppr_change_kmb_state(const struct ppr_context *ctx,
+                                const struct ppr_resolved *resolved,
+                                enum ppr_patch_action action) {
+    struct ppr_state before, after;
+    int install = action == PPR_PATCH_KMB_RANGE_INSTALL;
+    if (!ppr_kmb_supported(ctx)) {
+        ppr_logf(ctx, "[!] FsWrite KMB range patch is unavailable for MP4 %s",
+                 ctx->profile->name);
+        return -1;
+    }
+    if (ppr_read_kmb_state(ctx, resolved, &before) != 0)
+        return -1;
+    ppr_print_kmb_state(ctx, &before);
+    if (!ppr_kmb_state_known(&before)) {
+        ppr_logf(ctx, "[!] FsWrite KMB change refused: instruction must be an exact stock or patched value");
+        return -1;
+    }
+    if ((install && ppr_kmb_state_patched(&before)) ||
+        (!install && ppr_kmb_state_stock(&before))) {
+        ppr_logf(ctx, "[+] FsWrite opcode 0x53 KMB range guard is already %s",
+                 install ? "bypassed" : "stock");
+        ppr_print_stats(ctx);
+        return 0;
+    }
+
+    uint32_t desired = install ? ctx->profile->fswrite_kmb_range_patch
+                               : ctx->profile->fswrite_kmb_range_stock;
+    if (ppr_write_checked(ctx, resolved->fswrite_kmb_range, &desired, 4,
+                          "FsWrite encrypt KMB range instruction") != 0 ||
+        ppr_read_kmb_state(ctx, resolved, &after) != 0) {
+        ppr_logf(ctx, "[!] FsWrite KMB update failed");
+        return -1;
+    }
+    ppr_print_kmb_state(ctx, &after);
+    ppr_print_stats(ctx);
+    return install ? (ppr_kmb_state_patched(&after) ? 0 : -1)
+                   : (ppr_kmb_state_stock(&after) ? 0 : -1);
+}
+
 int ppr_patch_run(const struct ppr_patch_transport *transport,
                   uint32_t firmware, enum ppr_patch_action action,
                   int idle_acknowledged) {
@@ -818,8 +860,12 @@ int ppr_patch_run(const struct ppr_patch_transport *transport,
 
     struct ppr_resolved resolved = {0};
     struct ppr_state before, after;
-    if (ppr_resolve(&ctx, &resolved) != 0 ||
-        ppr_read_state(&ctx, &resolved, &before) != 0)
+    if (ppr_resolve(&ctx, &resolved) != 0)
+        return -1;
+    if (action == PPR_PATCH_KMB_RANGE_INSTALL ||
+        action == PPR_PATCH_KMB_RANGE_UNINSTALL)
+        return ppr_change_kmb_state(&ctx, &resolved, action);
+    if (ppr_read_state(&ctx, &resolved, &before) != 0)
         return -1;
     ppr_print_state(&ctx, &before);
 
@@ -830,40 +876,14 @@ int ppr_patch_run(const struct ppr_patch_transport *transport,
         ppr_logf(&ctx, "[*] plaintext cave VA=0x%lx PA=0x%lx",
                  (unsigned long)profile->plaintext_cave_va,
                  (unsigned long)resolved.plaintext_cave);
-        ppr_logf(&ctx, "[*] encryption KMB range VA=0x%lx PA=0x%lx",
-                 (unsigned long)profile->encrypt_kmb_range_va,
-                 (unsigned long)resolved.encrypt_kmb_range);
+        if (ppr_kmb_supported(&ctx))
+            ppr_logf(&ctx, "[*] FsWrite KMB range guard VA=0x%lx PA=0x%lx",
+                     (unsigned long)profile->fswrite_kmb_range_va,
+                     (unsigned long)resolved.fswrite_kmb_range);
         ppr_print_stats(&ctx);
         return (before.native || before.dynamic) &&
-               before.encrypt_kmb_range_known ? 0 : -1;
-    }
-
-    if (action == PPR_PATCH_KMB_RANGE_INSTALL ||
-        action == PPR_PATCH_KMB_RANGE_UNINSTALL) {
-        int range_install = action == PPR_PATCH_KMB_RANGE_INSTALL;
-        if (!before.encrypt_kmb_range_known) {
-            ppr_logf(&ctx, "[!] KMB range change refused: exact stock or patched instruction required");
-            return -1;
-        }
-        if ((range_install && before.encrypt_kmb_range_patched) ||
-            (!range_install && before.encrypt_kmb_range_stock)) {
-            ppr_logf(&ctx, "[+] encryption KMB range is already %s",
-                     range_install ? "extended" : "stock");
-            ppr_print_stats(&ctx);
-            return 0;
-        }
-
-        uint32_t value = range_install
-            ? profile->encrypt_kmb_range_patch
-            : profile->encrypt_kmb_range_stock;
-        if (ppr_write_checked(&ctx, resolved.encrypt_kmb_range, &value, 4,
-                              "ExtFs encrypt KMB upper-bound instruction") != 0 ||
-            ppr_read_state(&ctx, &resolved, &after) != 0)
-            return -1;
-        ppr_print_state(&ctx, &after);
-        ppr_print_stats(&ctx);
-        return range_install ? (after.encrypt_kmb_range_patched ? 0 : -1)
-                             : (after.encrypt_kmb_range_stock ? 0 : -1);
+               (ppr_kmb_state_stock(&before) ||
+                ppr_kmb_state_patched(&before)) ? 0 : -1;
     }
 
     int install = action == PPR_PATCH_INSTALL ||
@@ -891,9 +911,9 @@ int ppr_patch_run(const struct ppr_patch_transport *transport,
         /* Build dormant code first, then connect control-flow sites. */
         if (ppr_write_pair_checked(
                 &ctx, resolved.plaintext_cave, ctx.images.plaintext,
-                PPR_PLAINTEXT_SIZE, "plaintext SRAM-tail cave",
+                PPR_PLAINTEXT_SIZE, "plaintext executable-tail cave",
                 resolved.runtime_cave, ctx.images.runtime,
-                PPR_RUNTIME_SIZE, "runtime controller cave") != 0 ||
+                PPR_RUNTIME_SIZE, "runtime executable-tail cave") != 0 ||
             ppr_write_sites(&ctx, &resolved, PPR_CALL_COUNT,
                             PPR_SITE_COUNT, 1) != 0 ||
             ppr_write_sites(&ctx, &resolved, 0, PPR_CALL_COUNT, 1) != 0) {

@@ -9,5 +9,5 @@ SECTIONS
     /DISCARD/ : { *(.comment) *(.note*) }
 }
 
-ASSERT(SIZEOF(.runtime) == 0x48, "unexpected PPR runtime wrapper size")
-ASSERT(SIZEOF(.plaintext) == 0x98, "unexpected PPR plaintext wrapper size")
+ASSERT(SIZEOF(.runtime) == 0x4c, "unexpected PPR runtime wrapper size")
+ASSERT(SIZEOF(.plaintext) == 0xa0, "unexpected PPR plaintext wrapper size")

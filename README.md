@@ -6,7 +6,7 @@ This project builds a profile-driven A53 patcher with two independent
 features:
 
 - a dynamic per-request `NATIVE` / `PLAINTEXT_NOAUTH` PPR-PFS read selector;
-- an optional ExtFs/opcode-0x53 encryption KMB-range extension.
+- an optional opcode-0x53 encryption KMB-whitelist bypass.
 
 The selector replaces only the cryptographic part of marked 64 KiB package
 reads. Native requests still use the original A53 helper with unchanged
@@ -18,8 +18,8 @@ mounts can alternate after one installation.
 > binds, and unmount work; the payload cannot prove that condition itself.
 
 The detailed queue and caller analysis is available in
-[`PPR_READ_PATHS.md`](PPR_READ_PATHS.md). Its Russian version is
-[`PPR_READ_PATHS_RU.md`](PPR_READ_PATHS_RU.md).
+[`PPR_READ_PATHS.md`](../PPR_READ_PATHS.md). Its Russian version is
+[`PPR_READ_PATHS_RU.md`](../PPR_READ_PATHS_RU.md).
 
 ## Contents
 
@@ -40,9 +40,11 @@ export PS5_PAYLOAD_SDK=/opt/ps5-payload-sdk
 make -j2
 ```
 
-The verification target expects one A53 ELF for every profile compiled into
-`ppr_patch.c`. Default paths and their override variables are defined in the
-`Makefile`.
+The checked-in `ppr_profiles.inc` contains all 54 archived MP4 releases from
+1.00 through 11.40. `make profiles` regenerates it from `PPR_FULL_ROOT`
+(`../../MP4_1.00-12.00` by default), using `PPR_DRAM_ROOT`
+(`/mnt/j/PS5Dev/mp4`) as a fallback. `make verify` independently extracts and
+checks every profile against those ELFs.
 
 Artifacts are written to `build/`:
 
@@ -53,17 +55,18 @@ Artifacts are written to `build/`:
 - `a53_ppr_plaintext.elf` — install alias for launchers without arguments;
 - `a53_ppr_native.elf` — stock-restore alias for launchers without arguments;
 - `a53_ppr_uninstall.elf` — restore the exact stock entry instructions;
-- `a53_kmb_range_install.elf` — extend the ExtFs allocator and bypass the
-  independent opcode-0x53 AES-index whitelist;
-- `a53_kmb_range_uninstall.elf` — restore all three exact stock instructions.
+- `a53_kmb_range_install.elf` — bypass the opcode-0x53 AES-index whitelist;
+- `a53_kmb_range_uninstall.elf` — restore its exact stock instruction.
 
 ## Exact profiles, not firmware assumptions
 
 Each binary reads the full A53 `releases/XX.XX` suffix and selects an exact
-profile. The resolver then validates the live IO and DRAM-IO segment records,
-maps executable SRAM and G6 addresses, and compares every connected patch
-site with its expected stock or current word. An unknown release, layout,
-instruction, or connected trampoline fails before the first write.
+profile. Releases 1.x use their merged DEV text layout, 2.x/3.x use the legacy
+split ABI, 4.x through 10.x use the current ABI, and 11.x use the late ABI.
+The resolver validates the matching live segment records, maps executable
+SRAM or G6 addresses, and compares every connected patch site with its
+expected stock or current word. An unknown release, layout, instruction, or
+connected trampoline fails before the first write.
 
 Addresses are data owned by a profile, not assumptions in the algorithm. For
 example only, the 9.40 profile places the shared package decrypt/auth helper at
@@ -97,9 +100,8 @@ entry instructions. The two `--mode` commands are compatibility aliases:
 it. They do not set a persistent global mode.
 
 `--status` is read-only. It reports selector state, resolved cave addresses,
-the independent KMB-range state, and transport counters. It succeeds only for
-a complete stock or installed selector image and a known stock or extended
-KMB-range instruction.
+the independent KMB-range state when that guard exists, and transport
+counters. It succeeds for a complete stock or installed selector image.
 
 ## Read-path coverage
 
@@ -174,19 +176,22 @@ queue number.
 
 ## Independent KMB-range extension
 
-`--kmb-range-install` changes two independent validators. In
-`ExtFs_EncryptAndCalculateSha`, it selects the complete 9-bit hardware
-aperture with exclusive upper bound 512. In
-`FlashWriteEncryptAndCalculateSha` (opcode `0x53`), it redirects both
-AES-index whitelist rejection branches to the native success block. Opcode
+`--kmb-range-install` changes only
+`FlashWriteEncryptAndCalculateSha` (opcode `0x53`). It redirects only the
+out-of-range rejection branch to the native success block; the stock
+per-index filter inside its original range is unchanged. Opcode
 `0x53` still has 8-bit AES/SHA fields, so its callers are limited to slots
 0..255 and an XTS base no greater than 254.
 
+The ExtFs encryption range instruction is not read, changed, or restored by
+this payload.
+
 This operation neither installs nor removes the read selector. It is accepted
-only when all three current instructions exactly match known stock or patched
-words, and every write is read back. A prior ExtFs-only install is recognized
-as a recoverable partial state. `--kmb-range-uninstall` restores all three
-exact profile-specific stock instructions.
+only when the current instruction exactly matches the known stock or patched
+word, and every write is read back. `--kmb-range-uninstall` restores the exact
+profile-specific stock instruction. The independently patchable guard exists
+in the 4.x through 10.x ABI; the KMB-range commands fail as unsupported on
+1.x through 3.x and 11.x, without affecting selector support.
 
 ## Patch-state safety
 
@@ -197,8 +202,8 @@ by readback and the complete final state is reread.
 
 An interrupted transaction is recoverable only when both current trampolines
 are complete and every entry word is an exact stock/current value. Unknown
-connected bytes are never repaired speculatively. The three KMB-range
-instructions have the same exact stock/patched policy but remain a separate
+connected bytes are never repaired speculatively. The opcode-0x53 KMB
+instruction has the same exact stock/patched policy but remains a separate
 state.
 
 ## Verification
@@ -208,10 +213,10 @@ make verify
 make host-test
 ```
 
-`make verify` checks the supplied A53 ELFs, segment sizes and flags, all twelve
-patch sites and branch targets, helper/IdmaPt/submit ABIs, plaintext queue
-ordering and notifications, the KMB allocator guard, unused executable-tail
-space, and byte-for-byte equality of C-generated and assembled wrappers.
+`make verify` checks all 54 supplied A53 ELFs, all twelve patch sites and
+branch targets, helper/IdmaPt/submit ABIs, executable-tail placement, the
+available opcode-0x53 KMB guards, and byte-for-byte equality of C-generated
+and assembled legacy/current/late wrappers.
 
 `make host-test` exercises status, idle gating, install, interrupted-state
 recovery, uninstall, independent KMB install/uninstall, unknown-instruction
