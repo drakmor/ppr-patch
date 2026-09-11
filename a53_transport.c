@@ -30,9 +30,11 @@
 #define SDBGP_WRITE_MEMORY      0x01040031U
 #define SDBGP_GET_CONF          0x01010010U
 #define SDBGP_RES_READ_MEMORY   0x02040021U
+#define SDBGP_RES_GET_CONF      0x02010010U
 #define SDBGP_MAX_WRITE_CHUNK   0x10000U
 #define SDBGP_BATCH_READ_MAX    16U
-#define SDBGP_RESPONSE_SCAN     0x800U
+#define SDBGP_MIXED_WRITE_MAX   8U
+#define SDBGP_MIXED_ITEM_MAX    0x100U
 #define SDBGP_BATCH_SCAN_CAP    0x4000U
 
 #define SYSCORE_AUTH_ID      0x4800000000000007ULL
@@ -51,8 +53,9 @@ struct deci5s_hdr {
 struct deci5s_cmd_hdr {
     struct deci5s_hdr header;
     uint32_t dcmp, code;
-    uint64_t pad0;
-    uint8_t unknown0[4], num_commands, unknown1[3];
+    uint32_t sequence_no, packet_no;
+    uint32_t attr;
+    uint8_t num_commands, reserved[3];
 };
 
 struct deci5s_mem_arg {
@@ -94,6 +97,19 @@ struct sdbgp_read_result {
     uint32_t padding;
 };
 
+struct sdbgp_packet_result {
+    uint64_t buffer;
+    uint32_t buffer_size;
+    uint32_t sequence_no;
+};
+
+struct sdbgp_response_view {
+    size_t packet_offset;
+    size_t commands_offset;
+    size_t packet_end;
+    uint32_t command_count;
+};
+
 _Static_assert(sizeof(struct deci5s_hdr) == 0x28, "DECI5S header ABI");
 _Static_assert(sizeof(struct deci5s_cmd_hdr) == 0x40, "SDBGP outer ABI");
 _Static_assert(sizeof(struct sdbgp_command) == 0x18, "SDBGP command ABI");
@@ -103,6 +119,13 @@ _Static_assert(sizeof(struct sdbgp_write_command) == 0x28,
                "SDBGP write ABI");
 _Static_assert(sizeof(struct sdbgp_read_result) == 0x28,
                "SDBGP result ABI");
+
+static int parse_read_response(const uint8_t *raw, size_t raw_size,
+                               uint32_t sequence_no,
+                               uint32_t response_command_count,
+                               uint32_t command_number,
+                               uint64_t expected_address,
+                               uint32_t expected_size, void *destination);
 
 extern uint64_t sceKernelReadTsc(void);
 
@@ -136,8 +159,22 @@ static uint64_t kread64(uint64_t address) {
     return value;
 }
 
-static void kwrite32(uint64_t address, uint32_t value) {
-    (void)kernel_copyin(&value, address, sizeof(value));
+static int kread32_checked(uint64_t address, uint32_t *value) {
+    if (!value)
+        return -1;
+    *value = 0;
+    return kernel_copyout(address, value, sizeof(*value));
+}
+
+static int kread64_checked(uint64_t address, uint64_t *value) {
+    if (!value)
+        return -1;
+    *value = 0;
+    return kernel_copyout(address, value, sizeof(*value));
+}
+
+static int kwrite32(uint64_t address, uint32_t value) {
+    return kernel_copyin(&value, address, sizeof(value));
 }
 
 static uint64_t swap_auth(uint64_t auth_id) {
@@ -192,6 +229,7 @@ static int initialize_mailbox(void) {
     int fd = -1;
     int kq = -1;
     int started = 0;
+    uint8_t mp4_snapshot[0x1000];
 
     if (revoke(path) < 0)
         printf("[!] revoke %s: %s (errno=%d)\n",
@@ -240,12 +278,21 @@ static int initialize_mailbox(void) {
         goto out;
     }
 
+    /* One coherent pre-FINISH snapshot replaces the overlapping scalar
+     * kernel_copyout calls used to locate state/flags. */
+    if (kernel_copyout(g_mp4sc, mp4_snapshot, sizeof(mp4_snapshot)) != 0) {
+        puts("[!] failed to snapshot the MP4 mailbox state");
+        goto out;
+    }
+
     uint64_t state_slot = 0;
     uint64_t flags_slot = 0;
     uint64_t buffer_slot = 0;
     for (uint32_t offset = 8; offset < 0x1000; offset += 4) {
-        uint32_t flags = kread32(g_mp4sc + offset);
-        uint32_t state = kread32(g_mp4sc + offset - 8);
+        uint32_t flags = 0;
+        uint32_t state = 0;
+        memcpy(&flags, mp4_snapshot + offset, sizeof(flags));
+        memcpy(&state, mp4_snapshot + offset - 8, sizeof(state));
         if ((flags & 0xffffU) == 0x212U &&
             (state & ~0x10U) == 0xfU) {
             state_slot = g_mp4sc + offset - 8;
@@ -265,22 +312,34 @@ static int initialize_mailbox(void) {
         puts("[!] coredump mailbox state/flags were not found");
         goto out;
     }
+    /* FINISH publishes the buffer/IOMMU/size slots.  Preserve the original
+     * ordering with a second coherent snapshot instead of reusing the
+     * pre-FINISH state image. */
+    if (kernel_copyout(g_mp4sc, mp4_snapshot, sizeof(mp4_snapshot)) != 0) {
+        puts("[!] failed to snapshot the finalized MP4 mailbox state");
+        goto out;
+    }
     uint64_t first = (flags_slot - g_mp4sc) / 8;
     for (uint64_t index = first; index < 0x1000 / 8; index++) {
         uint64_t slot = g_mp4sc + index * 8;
-        uint64_t value = kread64(slot);
+        uint64_t value = 0;
+        memcpy(&value, mp4_snapshot + index * 8, sizeof(value));
         if ((value >> 40) == 0xffffffULL &&
             (value & 0xfffffULL) == 0) {
             buffer_slot = slot;
             break;
         }
     }
-    if (!buffer_slot) {
+    if (!buffer_slot || buffer_slot < g_mp4sc + 16) {
         puts("[!] coredump mailbox buffer was not found");
         goto out;
     }
 
-    uint64_t buffer = kread64(buffer_slot);
+    uint64_t buffer = 0;
+    if (kread64_checked(buffer_slot, &buffer) != 0) {
+        puts("[!] failed to recheck the coredump buffer pointer");
+        goto out;
+    }
     if ((buffer >> 40) != 0xffffffULL || (buffer & 0xfffffULL) != 0) {
         printf("[!] invalid coredump buffer pointer: 0x%lx\n",
                (unsigned long)buffer);
@@ -377,14 +436,26 @@ static int open_persistent_transport(void) {
 }
 
 static int send_packet(struct deci5s_hdr *packet, uint32_t packet_length,
-                       const void *data, uint32_t data_length) {
+                       const void *data, uint32_t data_length,
+                       struct sdbgp_packet_result *response) {
     uint64_t started = sceKernelReadTsc();
     uint64_t original_auth = swap_auth(SYSCORE_AUTH_ID);
     int result = -1;
     int fd = -1;
     int kq = -1;
     int owns_pair = 0;
+    uint64_t buffer = 0;
+    uint64_t iommu = 0;
+    uint64_t raw_buffer_size = 0;
+    uint32_t request = 0;
     ++g_transactions;
+    if (response)
+        memset(response, 0, sizeof(*response));
+
+    if (!packet || packet_length < data_length ||
+        packet_length - data_length < sizeof(struct deci5s_cmd_hdr) ||
+        (data_length && !data))
+        goto out;
 
     if (g_persistent) {
         if (open_persistent_transport() != 0)
@@ -397,26 +468,59 @@ static int send_packet(struct deci5s_hdr *packet, uint32_t packet_length,
         owns_pair = 1;
     }
 
-    kwrite32(g_state_addr, ~0x10U);
-    kwrite32(g_flags_addr, 0x210U);
+    if (kwrite32(g_state_addr, ~0x10U) != 0 ||
+        kwrite32(g_flags_addr, 0x210U) != 0) {
+        puts("[!] failed to prepare the coredump mailbox state");
+        goto out;
+    }
+    /* Validate the complete aperture before copying any caller-controlled
+     * packet bytes into it. */
+    if (kread64_checked(g_buffer_slot, &buffer) != 0 || !buffer ||
+        (buffer >> 40) != 0xffffffULL || (buffer & 0xfffffULL) != 0 ||
+        packet_length > UINT64_MAX - buffer ||
+        kread64_checked(g_iommu_slot, &iommu) != 0 ||
+        kread64_checked(g_size_slot, &raw_buffer_size) != 0 ||
+        raw_buffer_size > UINT32_MAX || raw_buffer_size < packet_length) {
+        puts("[!] invalid coredump mailbox buffer/IOMMU/size state");
+        goto out;
+    }
+
+    if (kread32_checked(g_mp4sc + 0x160, &request) != 0) {
+        puts("[!] failed to read the coredump request sequence");
+        goto out;
+    }
+    request++;
+
+    /* Canonical A53 copies the outer SDBGP sequence_no into the response.
+     * Bind every parser to the current kernel request generation so bytes
+     * left after an earlier, longer response cannot satisfy readback. */
     packet->timestamp = sceKernelReadTsc();
+    ((struct deci5s_cmd_hdr *)packet)->sequence_no = request;
 
-    uint64_t buffer = kread64(g_buffer_slot);
-    (void)kernel_copyin(packet, buffer, packet_length - data_length);
-    if (data && data_length)
-        (void)kernel_copyin(data, buffer + packet_length - data_length,
-                            data_length);
+    if (kernel_copyin(packet, buffer, packet_length - data_length) != 0) {
+        puts("[!] failed to copy the DECI5S packet into the mailbox");
+        goto out;
+    }
+    if (data_length &&
+        kernel_copyin(data, buffer + packet_length - data_length,
+                      data_length) != 0) {
+        puts("[!] failed to copy DECI5S inline data into the mailbox");
+        goto out;
+    }
+    uint32_t buffer_size = (uint32_t)raw_buffer_size;
+    if (kwrite32(g_zcn_bar2 + 0xf7000, (uint32_t)(iommu >> 32)) != 0 ||
+        kwrite32(g_zcn_bar2 + 0xf8000, (uint32_t)iommu) != 0 ||
+        kwrite32(g_zcn_bar2 + 0xf9000, buffer_size) != 0) {
+        puts("[!] failed to program the coredump mailbox aperture");
+        goto out;
+    }
 
-    uint64_t iommu = kread64(g_iommu_slot);
-    uint32_t buffer_size = (uint32_t)kread64(g_size_slot);
-    kwrite32(g_zcn_bar2 + 0xf7000, (uint32_t)(iommu >> 32));
-    kwrite32(g_zcn_bar2 + 0xf8000, (uint32_t)iommu);
-    kwrite32(g_zcn_bar2 + 0xf9000, buffer_size);
-
-    uint32_t request = kread32(g_mp4sc + 0x160) + 1;
-    kwrite32(g_mp4sc + 0x160, request);
-    kwrite32(g_mp4sc + 0x164, MP4_COREDUMP_CMD);
-    kwrite32(g_zcn_bar2 + 0xf6000, MP4_COREDUMP_CMD);
+    if (kwrite32(g_mp4sc + 0x160, request) != 0 ||
+        kwrite32(g_mp4sc + 0x164, MP4_COREDUMP_CMD) != 0 ||
+        kwrite32(g_zcn_bar2 + 0xf6000, MP4_COREDUMP_CMD) != 0) {
+        puts("[!] failed to trigger the coredump mailbox request");
+        goto out;
+    }
 
     struct kevent event;
     struct timespec timeout = {15, 0};
@@ -434,14 +538,18 @@ static int send_packet(struct deci5s_hdr *packet, uint32_t packet_length,
         result = 0;
     }
 
-    uint32_t finish[2] = {8, 0};
-    if (ioctl(fd, IOCTL_FINISH, finish) < 0) {
-        perror("[!] ioctl FINISH");
-        if (result == 0)
-            result = -3;
-    }
-
 out:
+    /* Every successfully opened dump descriptor gets exactly one FINISH,
+     * including pre-trigger copy/MMIO failures.  Otherwise an optimization
+     * failure could leave the mailbox session itself wedged. */
+    if (fd >= 0) {
+        uint32_t finish[2] = {8, 0};
+        if (ioctl(fd, IOCTL_FINISH, finish) < 0) {
+            perror("[!] ioctl FINISH");
+            if (result == 0)
+                result = -3;
+        }
+    }
     if (owns_pair) {
         if (kq >= 0)
             close(kq);
@@ -452,6 +560,11 @@ out:
     }
     swap_auth(original_auth);
     g_elapsed_ticks += sceKernelReadTsc() - started;
+    if (result == 0 && response) {
+        response->buffer = buffer;
+        response->buffer_size = (uint32_t)raw_buffer_size;
+        response->sequence_no = request;
+    }
     return result;
 }
 
@@ -491,19 +604,27 @@ static int read_memory(uint64_t address, void *destination, uint32_t size) {
     packet.argument.addr = address;
     packet.argument.size = size;
 
-    uint64_t buffer = kread64(g_buffer_slot);
-    if (send_packet(&packet.header.header, sizeof(packet), NULL, 0) != 0)
+    struct sdbgp_packet_result response;
+    if (send_packet(&packet.header.header, sizeof(packet), NULL, 0,
+                    &response) != 0)
         return -1;
-    int64_t transferred = (int64_t)kread64(buffer + 0xf8);
-    if (transferred <= 0 || (uint64_t)transferred < size) {
-        printf("[!] A53 read 0x%lx returned %lld bytes\n",
-               (unsigned long)address, (long long)transferred);
+
+    size_t scan_size = response.buffer_size;
+    if (scan_size > SDBGP_BATCH_SCAN_CAP)
+        scan_size = SDBGP_BATCH_SCAN_CAP;
+    uint8_t *raw = calloc(1, scan_size);
+    if (!raw)
+        return -1;
+    int parsed = kernel_copyout(response.buffer, raw, scan_size) == 0 &&
+        parse_read_response(raw, scan_size, response.sequence_no, 1, 0,
+                            address, size, destination) == 0;
+    free(raw);
+    if (!parsed) {
+        printf("[!] A53 read 0x%lx response validation failed\n",
+               (unsigned long)address);
         return -1;
     }
-    (void)kernel_copyout(buffer + 0x108, destination, size);
-    /* ppr_patch's scalar-read callback follows the original transport ABI:
-     * a positive transferred-byte count is success, zero/negative is error. */
-    return (int)transferred;
+    return (int)size;
 }
 
 static int write_memory(uint64_t address, const void *source, uint32_t size) {
@@ -532,51 +653,144 @@ static int write_memory(uint64_t address, const void *source, uint32_t size) {
         puts("[!] SDBGP write packet exceeds the mailbox buffer");
         return -1;
     }
-    return send_packet(&packet.header.header, total, source, size);
+    return send_packet(&packet.header.header, total, source, size, NULL);
+}
+
+static int locate_sdbgp_response(const uint8_t *raw, size_t raw_size,
+                                 uint32_t sequence_no,
+                                 uint32_t response_command_count,
+                                 struct sdbgp_response_view *view) {
+    struct sdbgp_response_view found = {0};
+    int matches = 0;
+
+    if (!raw || !view || response_command_count == 0 ||
+        response_command_count > SDBGP_BATCH_READ_MAX)
+        return -1;
+
+    /* /dev/mp4/dump prefixes the returned DECI5S packet with private data.
+     * Find one complete current response envelope, not an isolated result
+     * pattern.  The request packet may still be present in the same aperture;
+     * swapped src/dst and the echoed sequence distinguish it from the reply. */
+    for (size_t packet_offset = 0;
+         packet_offset + sizeof(struct deci5s_cmd_hdr) <= raw_size;
+         packet_offset += sizeof(uint32_t)) {
+        struct deci5s_cmd_hdr outer;
+        uint32_t command_count = 0;
+        memcpy(&outer, raw + packet_offset, sizeof(outer));
+        memcpy(&command_count, &outer.num_commands, sizeof(command_count));
+
+        if (outer.header.magic != DECI5S_MAGIC ||
+            outer.header.self_size != sizeof(struct deci5s_hdr) ||
+            outer.header.src != DECI5S_DST_MP4 ||
+            outer.header.dst != DECI5S_SRC_KERNEL ||
+            outer.header.protocol_id != DECI5S_PROTO_SDBGP ||
+            outer.header.packet_size < sizeof(struct deci5s_cmd_hdr) ||
+            outer.header.packet_size > raw_size - packet_offset ||
+            outer.dcmp != DECI5S_DCMP ||
+            outer.code != outer.header.packet_size - sizeof(struct deci5s_hdr) ||
+            outer.sequence_no != sequence_no || outer.packet_no != 0 ||
+            outer.attr != 1 || command_count != response_command_count)
+            continue;
+
+        size_t packet_end = packet_offset + outer.header.packet_size;
+        size_t command_offset = packet_offset + sizeof(outer);
+        uint32_t seen_commands = 0;
+        int valid = 1;
+        for (uint32_t i = 0; i < command_count; i++) {
+            struct sdbgp_command command;
+            if (command_offset + sizeof(command) > packet_end) {
+                valid = 0;
+                break;
+            }
+            memcpy(&command, raw + command_offset, sizeof(command));
+            if (command.self_size < sizeof(command) ||
+                command.total_size < command.self_size ||
+                command.total_size > packet_end - command_offset ||
+                command.command_no >= command_count ||
+                (seen_commands & (1U << command.command_no)) != 0) {
+                valid = 0;
+                break;
+            }
+            seen_commands |= 1U << command.command_no;
+            command_offset += command.total_size;
+        }
+        if (!valid || command_offset != packet_end ||
+            seen_commands != ((1U << command_count) - 1U))
+            continue;
+
+        if (matches++ != 0)
+            return -1;
+        found.packet_offset = packet_offset;
+        found.commands_offset = packet_offset + sizeof(outer);
+        found.packet_end = packet_end;
+        found.command_count = command_count;
+    }
+
+    if (matches != 1)
+        return -1;
+    *view = found;
+    return 0;
+}
+
+static int find_response_command(const uint8_t *raw,
+                                 const struct sdbgp_response_view *view,
+                                 uint32_t command_number,
+                                 uint32_t expected_type,
+                                 size_t *command_offset_out,
+                                 struct sdbgp_command *command_out) {
+    if (!raw || !view || !command_offset_out || !command_out ||
+        command_number >= view->command_count)
+        return -1;
+
+    size_t command_offset = view->commands_offset;
+    for (uint32_t i = 0; i < view->command_count; i++) {
+        struct sdbgp_command command;
+        memcpy(&command, raw + command_offset, sizeof(command));
+        if (command.command_no == command_number) {
+            if (command.type != expected_type)
+                return -1;
+            *command_offset_out = command_offset;
+            *command_out = command;
+            return 0;
+        }
+        command_offset += command.total_size;
+    }
+    return -1;
 }
 
 static int parse_read_response(const uint8_t *raw, size_t raw_size,
+                               uint32_t sequence_no,
+                               uint32_t response_command_count,
                                uint32_t command_number,
                                uint64_t expected_address,
                                uint32_t expected_size, void *destination) {
-    for (size_t type_offset = 8;
-         type_offset + sizeof(uint32_t) <= raw_size;
-         type_offset += sizeof(uint32_t)) {
-        uint32_t type;
-        memcpy(&type, raw + type_offset, sizeof(type));
-        if (type != SDBGP_RES_READ_MEMORY)
-            continue;
+    struct sdbgp_response_view view;
+    struct sdbgp_command command;
+    size_t command_offset = 0;
+    if (!destination || expected_size == 0 ||
+        locate_sdbgp_response(raw, raw_size, sequence_no,
+                              response_command_count, &view) != 0 ||
+        find_response_command(raw, &view, command_number,
+                              SDBGP_RES_READ_MEMORY, &command_offset,
+                              &command) != 0)
+        return -1;
 
-        size_t command_offset = type_offset - 8;
-        struct sdbgp_command command;
-        if (command_offset + sizeof(command) > raw_size)
-            continue;
-        memcpy(&command, raw + command_offset, sizeof(command));
-        if (command.command_no != command_number ||
-            command.self_size < sizeof(command) ||
-            command.total_size < command.self_size ||
-            command.total_size > raw_size - command_offset)
-            continue;
+    size_t result_offset = command_offset + command.self_size;
+    struct sdbgp_read_result result;
+    if (result_offset + sizeof(result) >
+        command_offset + command.total_size)
+        return -1;
+    memcpy(&result, raw + result_offset, sizeof(result));
+    if (result.self_size != sizeof(result) || result.status != 0 ||
+        result.addr != expected_address || result.requested != expected_size ||
+        result.transferred != expected_size)
+        return -1;
 
-        size_t result_offset = command_offset + command.self_size;
-        struct sdbgp_read_result result;
-        if (result_offset + sizeof(result) >
-            command_offset + command.total_size)
-            continue;
-        memcpy(&result, raw + result_offset, sizeof(result));
-        if (result.self_size != sizeof(result) || result.status != 0 ||
-            result.addr != expected_address ||
-            result.requested != expected_size ||
-            result.transferred != expected_size)
-            continue;
-
-        size_t data_offset = result_offset + sizeof(result);
-        if (expected_size > command_offset + command.total_size - data_offset)
-            continue;
-        memcpy(destination, raw + data_offset, expected_size);
-        return 0;
-    }
-    return -1;
+    size_t data_offset = result_offset + sizeof(result);
+    if (expected_size > command_offset + command.total_size - data_offset)
+        return -1;
+    memcpy(destination, raw + data_offset, expected_size);
+    return 0;
 }
 
 static int read_many(void *context, const uint64_t *addresses,
@@ -590,23 +804,33 @@ static int read_many(void *context, const uint64_t *addresses,
     if (!g_batch || !addresses || !sizes || !destinations || count == 0 ||
         count > SDBGP_BATCH_READ_MAX)
         return -1;
+    for (uint32_t i = 0; i < count; i++) {
+        if (!destinations[i] || sizes[i] == 0 || sizes[i] > 0x100U)
+            return -1;
+    }
 
     size_t packet_size = sizeof(struct deci5s_cmd_hdr) +
                          count * sizeof(struct read_block);
-    uint32_t mailbox_size = (uint32_t)kread64(g_size_slot);
-    if (packet_size > mailbox_size)
+    uint64_t raw_mailbox_size = 0;
+    if (kread64_checked(g_size_slot, &raw_mailbox_size) != 0 ||
+        raw_mailbox_size > UINT32_MAX || packet_size > raw_mailbox_size)
         return -1;
+    uint32_t mailbox_size = (uint32_t)raw_mailbox_size;
+    size_t scan_size = mailbox_size;
+    if (scan_size > SDBGP_BATCH_SCAN_CAP)
+        scan_size = SDBGP_BATCH_SCAN_CAP;
     uint8_t *packet = calloc(1, packet_size);
     if (!packet)
         return -1;
+    uint8_t *raw = calloc(1, scan_size);
+    if (!raw) {
+        free(packet);
+        return -1;
+    }
     struct deci5s_cmd_hdr *header = (struct deci5s_cmd_hdr *)packet;
     initialize_outer(header, (uint32_t)packet_size, (uint8_t)count);
     struct read_block *blocks = (struct read_block *)(header + 1);
     for (uint32_t i = 0; i < count; i++) {
-        if (!destinations[i] || sizes[i] == 0 || sizes[i] > 0x100U) {
-            free(packet);
-            return -1;
-        }
         blocks[i].command.common.self_size = sizeof(blocks[i].command);
         blocks[i].command.common.total_size = sizeof(blocks[i]);
         blocks[i].command.common.type = SDBGP_READ_MEMORY;
@@ -618,21 +842,24 @@ static int read_many(void *context, const uint64_t *addresses,
         blocks[i].argument.addr = addresses[i];
         blocks[i].argument.size = sizes[i];
     }
-    int result = send_packet(&header->header, (uint32_t)packet_size, NULL, 0);
+    struct sdbgp_packet_result response;
+    int result = send_packet(&header->header, (uint32_t)packet_size, NULL, 0,
+                             &response);
     free(packet);
-    if (result != 0)
+    if (result != 0) {
+        free(raw);
         return -1;
-
-    size_t scan_size = mailbox_size;
-    if (scan_size > SDBGP_BATCH_SCAN_CAP)
-        scan_size = SDBGP_BATCH_SCAN_CAP;
-    uint8_t *raw = calloc(1, scan_size);
-    if (!raw)
+    }
+    if (scan_size > response.buffer_size)
+        scan_size = response.buffer_size;
+    if (kernel_copyout(response.buffer, raw, scan_size) != 0) {
+        free(raw);
         return -1;
-    (void)kernel_copyout(kread64(g_buffer_slot), raw, scan_size);
+    }
     for (uint32_t i = 0; i < count; i++) {
-        if (parse_read_response(raw, scan_size, i, addresses[i], sizes[i],
-                                destinations[i]) != 0) {
+        if (parse_read_response(raw, scan_size, response.sequence_no, count,
+                                i, addresses[i], sizes[i], destinations[i]) !=
+            0) {
             free(raw);
             return -1;
         }
@@ -645,41 +872,55 @@ static uint32_t round_up_8(uint32_t value) {
     return (value + 7U) & ~7U;
 }
 
-static int write_pair_read_pair(
-        void *context, uint64_t address0, const void *source0, uint32_t size0,
-        void *readback0, uint64_t address1, const void *source1,
-        uint32_t size1, void *readback1) {
+static int write_many_read_many(
+        void *context, const uint64_t *addresses, const void *const *sources,
+        const uint32_t *sizes, void *const *destinations, uint32_t count) {
     (void)context;
     struct read_block {
         struct sdbgp_read_command command;
         struct deci5s_mem_arg argument;
     };
-    const uint64_t addresses[2] = {address0, address1};
-    const void *sources[2] = {source0, source1};
-    void *destinations[2] = {readback0, readback1};
-    const uint32_t sizes[2] = {size0, size1};
-    uint32_t write_sizes[2];
+    uint32_t write_sizes[SDBGP_MIXED_WRITE_MAX];
 
-    if (!g_mixed_io || !source0 || !source1 || !readback0 || !readback1 ||
-        size0 == 0 || size1 == 0 || size0 > SDBGP_MAX_WRITE_CHUNK ||
-        size1 > SDBGP_MAX_WRITE_CHUNK)
+    if (!g_mixed_io || !addresses || !sources || !sizes || !destinations ||
+        count == 0 || count > SDBGP_MIXED_WRITE_MAX)
         return -1;
-    for (uint32_t i = 0; i < 2; i++)
+    uint32_t packet_size = sizeof(struct deci5s_cmd_hdr) +
+                           count * sizeof(struct read_block);
+    for (uint32_t i = 0; i < count; i++) {
+        if (!sources[i] || !destinations[i] || sizes[i] == 0 ||
+            sizes[i] > SDBGP_MAX_WRITE_CHUNK ||
+            sizes[i] > SDBGP_MIXED_ITEM_MAX)
+            return -1;
         write_sizes[i] = sizeof(struct sdbgp_write_command) +
                          sizeof(struct deci5s_mem_arg) + round_up_8(sizes[i]);
-
-    uint32_t packet_size = sizeof(struct deci5s_cmd_hdr) + write_sizes[0] +
-                           write_sizes[1] + 2 * sizeof(struct read_block);
-    if (packet_size > (uint32_t)kread64(g_size_slot))
+        if (write_sizes[i] > UINT32_MAX - packet_size)
+            return -1;
+        packet_size += write_sizes[i];
+    }
+    uint64_t raw_mailbox_size = 0;
+    if (kread64_checked(g_size_slot, &raw_mailbox_size) != 0 ||
+        raw_mailbox_size > UINT32_MAX || packet_size > raw_mailbox_size)
         return -1;
+    uint32_t mailbox_size = (uint32_t)raw_mailbox_size;
+    size_t scan_size = mailbox_size;
+    if (scan_size > SDBGP_BATCH_SCAN_CAP)
+        scan_size = SDBGP_BATCH_SCAN_CAP;
     uint8_t *packet = calloc(1, packet_size);
     if (!packet)
         return -1;
+    /* Allocate every fallible host buffer before the packet can mutate A53
+     * memory.  After send_packet succeeds, only copyout/validation remains. */
+    uint8_t *raw = calloc(1, scan_size);
+    if (!raw) {
+        free(packet);
+        return -1;
+    }
     struct deci5s_cmd_hdr *header = (struct deci5s_cmd_hdr *)packet;
-    initialize_outer(header, packet_size, 4);
+    initialize_outer(header, packet_size, (uint8_t)(count * 2U));
 
     uint32_t offset = sizeof(*header);
-    for (uint32_t i = 0; i < 2; i++) {
+    for (uint32_t i = 0; i < count; i++) {
         struct sdbgp_write_command *command =
             (struct sdbgp_write_command *)(packet + offset);
         struct deci5s_mem_arg *argument =
@@ -697,12 +938,12 @@ static int write_pair_read_pair(
         memcpy(argument + 1, sources[i], sizes[i]);
         offset += write_sizes[i];
     }
-    for (uint32_t i = 0; i < 2; i++) {
+    for (uint32_t i = 0; i < count; i++) {
         struct read_block *block = (struct read_block *)(packet + offset);
         block->command.common.self_size = sizeof(block->command);
         block->command.common.total_size = sizeof(*block);
         block->command.common.type = SDBGP_READ_MEMORY;
-        block->command.common.command_no = i + 2;
+        block->command.common.command_no = i + count;
         block->command.n_args = 1;
         block->argument.self_size = sizeof(block->argument);
         block->argument.access_size = access_size(addresses[i], sizes[i]);
@@ -712,19 +953,41 @@ static int write_pair_read_pair(
         offset += sizeof(*block);
     }
 
-    int result = send_packet(&header->header, packet_size, NULL, 0);
+    struct sdbgp_packet_result response;
+    int result = send_packet(&header->header, packet_size, NULL, 0, &response);
     free(packet);
-    if (result != 0)
+    if (result != 0) {
+        free(raw);
         return -1;
-
-    uint8_t raw[SDBGP_RESPONSE_SCAN];
-    (void)kernel_copyout(kread64(g_buffer_slot), raw, sizeof(raw));
-    for (uint32_t i = 0; i < 2; i++) {
-        if (parse_read_response(raw, sizeof(raw), i + 2, addresses[i],
-                                sizes[i], destinations[i]) != 0)
-            return -1;
     }
+    if (scan_size > response.buffer_size)
+        scan_size = response.buffer_size;
+    if (kernel_copyout(response.buffer, raw, scan_size) != 0) {
+        free(raw);
+        return -1;
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        if (parse_read_response(raw, scan_size, response.sequence_no,
+                                count * 2U, i + count, addresses[i], sizes[i],
+                                destinations[i]) != 0) {
+            free(raw);
+            return -1;
+        }
+    }
+    free(raw);
     return 0;
+}
+
+static int write_pair_read_pair(
+        void *context, uint64_t address0, const void *source0, uint32_t size0,
+        void *readback0, uint64_t address1, const void *source1,
+        uint32_t size1, void *readback1) {
+    const uint64_t addresses[2] = {address0, address1};
+    const void *sources[2] = {source0, source1};
+    const uint32_t sizes[2] = {size0, size1};
+    void *destinations[2] = {readback0, readback1};
+    return write_many_read_many(context, addresses, sources, sizes,
+                                destinations, 2);
 }
 
 static int callback_read(void *context, uint64_t address, void *destination,
@@ -782,11 +1045,61 @@ int a53_transport_get_version(char *out, uint32_t out_size) {
     packet.command.self = sizeof(packet.command);
     packet.command.total = sizeof(packet.command);
     packet.command.type = SDBGP_GET_CONF;
-    uint64_t buffer = kread64(g_buffer_slot);
-    if (send_packet(&packet.header.header, sizeof(packet), NULL, 0) != 0)
+    struct sdbgp_packet_result response;
+    if (send_packet(&packet.header.header, sizeof(packet), NULL, 0,
+                    &response) != 0)
         return -1;
+
     memset(out, 0, out_size);
-    (void)kernel_copyout(buffer + 0x148, out, out_size - 1);
+    size_t scan_size = response.buffer_size;
+    if (scan_size > SDBGP_BATCH_SCAN_CAP)
+        scan_size = SDBGP_BATCH_SCAN_CAP;
+    uint8_t *raw = calloc(1, scan_size);
+    if (!raw || kernel_copyout(response.buffer, raw, scan_size) != 0) {
+        free(raw);
+        puts("[!] GET_CONF response copyout failed");
+        return -1;
+    }
+
+    struct sdbgp_response_view view;
+    struct sdbgp_command command;
+    size_t command_offset = 0;
+    if (locate_sdbgp_response(raw, scan_size, response.sequence_no, 1,
+                              &view) != 0 ||
+        find_response_command(raw, &view, 0, SDBGP_RES_GET_CONF,
+                              &command_offset, &command) != 0) {
+        free(raw);
+        puts("[!] GET_CONF response envelope validation failed");
+        return -1;
+    }
+
+    const char release_marker[] = "releases/";
+    size_t text_begin = command_offset + command.self_size;
+    size_t text_end = command_offset + command.total_size;
+    size_t marker = text_begin;
+    while (marker + sizeof(release_marker) - 1U <= text_end &&
+           memcmp(raw + marker, release_marker,
+                  sizeof(release_marker) - 1U) != 0)
+        marker++;
+    if (marker + sizeof(release_marker) - 1U > text_end) {
+        free(raw);
+        puts("[!] GET_CONF release string was not found in the current response");
+        return -1;
+    }
+
+    size_t string_begin = marker;
+    while (string_begin > text_begin && raw[string_begin - 1U] >= 0x20U &&
+           raw[string_begin - 1U] <= 0x7eU)
+        string_begin--;
+    size_t string_end = marker + sizeof(release_marker) - 1U;
+    while (string_end < text_end && raw[string_end] >= 0x20U &&
+           raw[string_end] <= 0x7eU)
+        string_end++;
+    size_t string_size = string_end - string_begin;
+    if (string_size >= out_size)
+        string_size = out_size - 1U;
+    memcpy(out, raw + string_begin, string_size);
+    free(raw);
     return 0;
 }
 
@@ -803,11 +1116,12 @@ uint32_t a53_transport_parse_release(const char *version) {
 
 int a53_transport_verify_and_enable_fast(
         const struct a53_transport_options *requested) {
-    uint8_t baseline[8];
-    uint32_t batch0 = 0;
-    uint32_t batch1 = 0;
-    uint8_t persistent0[8];
-    uint8_t persistent1[8];
+    uint32_t baseline = 0;
+    uint32_t batch_values[SDBGP_BATCH_READ_MAX] = {0};
+    uint32_t persistent0 = 0;
+    uint32_t persistent1 = 0;
+    int need_batch;
+    int combined_failed = 0;
     int batch_ok = 0;
     int persistent_ok = 0;
 
@@ -823,91 +1137,137 @@ int a53_transport_verify_and_enable_fast(
 
     if (!requested->persistent && !requested->batch && !requested->mixed_io)
         return 0;
+    need_batch = requested->batch || requested->mixed_io;
 
-    if (read_memory(PPR_PATCH_LAYOUT_PA, baseline, sizeof(baseline)) < 0) {
-        puts("[!] fast transport probe: scalar baseline read failed");
-        goto done;
-    }
-
-    if (requested->batch || requested->mixed_io) {
-        const uint64_t addresses[2] = {
-            PPR_PATCH_LAYOUT_PA,
-            PPR_PATCH_LAYOUT_PA + sizeof(uint32_t),
-        };
-        const uint32_t sizes[2] = {
-            sizeof(batch0), sizeof(batch1),
-        };
-        void *destinations[2] = {&batch0, &batch1};
-
-        g_batch = 1;
-        if (read_many(NULL, addresses, sizes, destinations, 2) == 0 &&
-            memcmp(&batch0, baseline, sizeof(batch0)) == 0 &&
-            memcmp(&batch1, baseline + sizeof(batch0), sizeof(batch1)) == 0) {
-            batch_ok = 1;
-        } else {
-            puts("[!] fast transport probe: batch read mismatch; disabling batch/mixed I/O");
-        }
-        g_batch = 0;
+    uint64_t addresses[SDBGP_BATCH_READ_MAX];
+    uint32_t sizes[SDBGP_BATCH_READ_MAX];
+    void *destinations[SDBGP_BATCH_READ_MAX];
+    for (uint32_t i = 0; i < SDBGP_BATCH_READ_MAX; i++) {
+        /* Repeat one immutable layout word: the purpose is to validate the
+         * real 16-command envelope used by an 8-write/8-read mutation, not
+         * to sample unrelated dynamic fields.  Passing 16 also covers the
+         * 15-command action preflight. */
+        addresses[i] = PPR_PATCH_LAYOUT_PA;
+        sizes[i] = sizeof(batch_values[i]);
+        destinations[i] = &batch_values[i];
     }
 
     if (requested->persistent) {
+        /* The common fast payload needs persistent+batch together.  Use the
+         * scalar baseline as request 1 and the batch comparison as request 2
+         * on the same descriptor.  That verifies both features (including
+         * their composition) with two transactions and one open. */
         g_persistent = 1;
-        if (read_memory(PPR_PATCH_LAYOUT_PA, persistent0,
-                        sizeof(persistent0)) >= 0 &&
-            read_memory(PPR_PATCH_LAYOUT_PA, persistent1,
-                        sizeof(persistent1)) >= 0 &&
-            memcmp(persistent0, baseline, sizeof(baseline)) == 0 &&
-            memcmp(persistent1, baseline, sizeof(baseline)) == 0) {
-            persistent_ok = 1;
+        if (read_memory(PPR_PATCH_LAYOUT_PA, &baseline,
+                        sizeof(baseline)) < 0) {
+            puts("[!] fast transport probe: persistent scalar baseline read failed");
+            goto done;
+        }
+
+        if (need_batch) {
+            g_batch = 1;
+            int batch_matches = read_many(
+                NULL, addresses, sizes, destinations,
+                SDBGP_BATCH_READ_MAX) == 0;
+            for (uint32_t i = 0; batch_matches &&
+                 i < SDBGP_BATCH_READ_MAX; i++)
+                batch_matches = batch_values[i] == baseline;
+            if (batch_matches) {
+                persistent_ok = 1;
+                batch_ok = 1;
+            } else {
+                /* A failed combined probe does not prove which feature
+                 * failed.  Probe each independently only on this uncommon
+                 * fallback path so a usable optimization is not discarded. */
+                combined_failed = 1;
+                puts("[!] fast transport probe: persistent batch mismatch; checking independent fallbacks");
+                a53_transport_shutdown();
+                g_persistent = 0;
+                g_batch = 1;
+                memset(batch_values, 0, sizeof(batch_values));
+                batch_matches = read_many(
+                    NULL, addresses, sizes, destinations,
+                    SDBGP_BATCH_READ_MAX) == 0;
+                for (uint32_t i = 0; batch_matches &&
+                     i < SDBGP_BATCH_READ_MAX; i++)
+                    batch_matches = batch_values[i] == baseline;
+                if (batch_matches) {
+                    batch_ok = 1;
+                } else {
+                    puts("[!] fast transport probe: batch read mismatch; disabling batch/mixed I/O");
+                }
+
+                g_batch = 0;
+                g_persistent = 1;
+                if (read_memory(PPR_PATCH_LAYOUT_PA, &persistent0,
+                                sizeof(persistent0)) >= 0 &&
+                    read_memory(PPR_PATCH_LAYOUT_PA, &persistent1,
+                                sizeof(persistent1)) >= 0 &&
+                    persistent0 == baseline && persistent1 == baseline) {
+                    persistent_ok = 1;
+                } else {
+                    puts("[!] fast transport probe: persistent reuse mismatch; disabling persistent transport");
+                }
+            }
         } else {
-            puts("[!] fast transport probe: persistent reuse mismatch; disabling persistent transport");
+            if (read_memory(PPR_PATCH_LAYOUT_PA, &persistent0,
+                            sizeof(persistent0)) >= 0 &&
+                persistent0 == baseline) {
+                persistent_ok = 1;
+            } else {
+                puts("[!] fast transport probe: persistent reuse mismatch; disabling persistent transport");
+            }
         }
-        g_persistent = 0;
-        a53_transport_shutdown();
-    }
-
-    if (requested->persistent && requested->batch &&
-        persistent_ok && batch_ok) {
-        const uint64_t addresses[2] = {
-            PPR_PATCH_LAYOUT_PA,
-            PPR_PATCH_LAYOUT_PA + sizeof(uint32_t),
-        };
-        const uint32_t sizes[2] = {
-            sizeof(batch0), sizeof(batch1),
-        };
-        void *destinations[2] = {&batch0, &batch1};
-
-        batch0 = 0;
-        batch1 = 0;
-        g_persistent = 1;
-        g_batch = 1;
-        if (read_many(NULL, addresses, sizes, destinations, 2) != 0 ||
-            memcmp(&batch0, baseline, sizeof(batch0)) != 0 ||
-            memcmp(&batch1, baseline + sizeof(batch0), sizeof(batch1)) != 0) {
-            puts("[!] fast transport probe: persistent batch mismatch; disabling batch/mixed I/O");
-            batch_ok = 0;
+    } else {
+        if (read_memory(PPR_PATCH_LAYOUT_PA, &baseline,
+                        sizeof(baseline)) < 0) {
+            puts("[!] fast transport probe: scalar baseline read failed");
+            goto done;
         }
-        g_persistent = 0;
-        g_batch = 0;
-        a53_transport_shutdown();
+        if (need_batch) {
+            g_batch = 1;
+            int batch_matches = read_many(
+                NULL, addresses, sizes, destinations,
+                SDBGP_BATCH_READ_MAX) == 0;
+            for (uint32_t i = 0; batch_matches &&
+                 i < SDBGP_BATCH_READ_MAX; i++)
+                batch_matches = batch_values[i] == baseline;
+            if (batch_matches) {
+                batch_ok = 1;
+            } else {
+                puts("[!] fast transport probe: batch read mismatch; disabling batch/mixed I/O");
+            }
+        }
     }
 
 done:
+    if (combined_failed && persistent_ok && batch_ok) {
+        /* Both features work independently, but their composition did not.
+         * Prefer batching because it removes far more transactions; never
+         * re-enable the failed persistent+batch combination. */
+        puts("[!] fast transport probe: independent modes pass but composition failed; using batch without persistence");
+        persistent_ok = 0;
+    }
+    /* Keep a successfully reused persistent descriptor for the patch itself;
+     * this avoids another revoke/open/kqueue registration after the probe. */
+    if (!persistent_ok)
+        a53_transport_shutdown();
     g_batch = requested->batch && batch_ok;
-    g_mixed_io = requested->mixed_io && batch_ok;
+    /* Do not issue a synthetic write merely to probe the mixed packet form:
+     * that would violate the zero-write guarantee before patch-state
+     * classification.  It uses the same validated multi-command envelope;
+     * the local write/result ABI is compile-time asserted above, and the first
+     * intended mutation includes its own exact readback. */
+    g_mixed_io = requested->mixed_io && g_batch;
     g_persistent = requested->persistent && persistent_ok;
-    printf("[+] verified transport: persistent=%s batch=%s mixed-io=%s\n",
-           g_persistent ? "on" : "off",
-           g_batch ? "on" : "off",
-           g_mixed_io ? "on" : "off");
 
     /* The capability probe is not part of the patch operation statistics.
-     * Its persistent descriptor was closed, so the next open is counted. */
+     * A verified persistent descriptor may already be open for request 3. */
     g_transactions = 0;
     g_transport_opens = 0;
     g_elapsed_ticks = 0;
-    return ((requested->batch && !batch_ok) ||
-            (requested->mixed_io && !batch_ok) ||
+    return ((requested->batch && !g_batch) ||
+            (requested->mixed_io && !g_mixed_io) ||
             (requested->persistent && !persistent_ok)) ? 1 : 0;
 }
 
@@ -916,6 +1276,12 @@ void a53_transport_make_ppr(struct ppr_patch_transport *out, int fast_mode) {
     out->read = callback_read;
     out->write = callback_write;
     out->read_many = g_batch ? read_many : NULL;
+    /* Keep production mutations within the packet shape proven by the
+     * original fast path: two writes followed by their two exact readbacks.
+     * The generic helper remains private so the pair adapter can share the
+     * strict response parser, timeout handling and bounds checks without
+     * exposing the newer 8-way mutation to the PPR state machine. */
+    out->write_many_read_many = NULL;
     out->write_pair_read_pair = g_mixed_io ? write_pair_read_pair : NULL;
     out->log = callback_log;
     out->transaction_count = callback_transactions;

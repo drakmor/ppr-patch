@@ -1,6 +1,6 @@
 /*
- * AArch64 source for the three MP4 PPR helper ABIs.  Link-time symbols and
- * section addresses come from the selected exact firmware profile.
+ * AArch64 wrappers for the MP4 PPR common read pipeline.  Link-time symbols
+ * and section addresses come from the selected exact firmware profile.
  */
 
 #ifndef PPR_ABI
@@ -13,231 +13,131 @@
 #define PPR_MERGED_TEXT 0
 #endif
 
+/*
+ * FE/FF are the values published by the kernel-side plaintext mount path.
+ * Replace them with values outside the hardware descriptor fields after the
+ * complete pair has matched.  The private markers scope the two internal
+ * hooks to requests which passed this entry selector; unrelated users of the
+ * shared descriptor producer retain native semantics.
+ */
+#define PPR_AES_MARKER 0x7ff
+#define PPR_SHA_MARKER 0x7fe
+
+#if PPR_MERGED_TEXT
+#define PPR_Q1_CYCLE_OFFSET 0x22
+#define PPR_ZCN_CONFIG_OFFSET 0x408
+#define PPR_ZCN_RELEASE_OFFSET 0x460
+#define PPR_ZCN_RELEASE_BITS_OFFSET 0x600
+#else
+#define PPR_Q1_CYCLE_OFFSET 0x14
+#define PPR_ZCN_CONFIG_OFFSET 0x308
+#define PPR_ZCN_RELEASE_OFFSET 0x360
+#define PPR_ZCN_RELEASE_BITS_OFFSET 0x458
+#endif
+
 .section .runtime, "ax"
 .balign 4
 .global ppr_wrapper
 .type ppr_wrapper, %function
 
 .extern original_helper
-.extern precheck_normal
-.extern precheck_special
-.extern common_error
-.extern dispatch_native
-.extern plaintext_idma
-.extern sha_wait_idma_aes
-.extern submit_idma_aes
-.extern common_return
-.extern ppr_plaintext_dispatch
+.extern aes_descriptor
+.extern plaintext_descriptor
 
 ppr_wrapper:
-    /*
-     * Signed outer reads carry SHA=fe/AES=ff, but the unsigned inner PFS can
-     * omit the SHA key and still carries the private AES sentinel.  FF is not
-     * an allocatable KMB index; letting it reach IdmaDecrypt produces IOC
-     * ILLEGAL_KMB_ACCESS.  Select plaintext on the AES sentinel alone.
-     */
-    ldrb    w16, [sp, #0x18] /* kmbIdxKeyAes */
+    /* Match the complete full-width pair.  Do not alias valid KMB indices. */
+    ldr     w16, [sp, #0x18]       /* kmbIdxKeyAes */
     cmp     w16, #0xff
-    b.eq    0f
-    nop                         /* keep ppr_precheck at runtime + 0x24 */
-    nop
-    b       original_helper
-0:
-    mov     w16, #0x7f
-    str     w16, [sp, #0x10]
-    b       original_helper
-
-ppr_precheck:
-#if PPR_ABI == 2
-    cbnz    w28, 1f
-#else
-    cbnz    w24, 1f
-#endif
-    b       precheck_normal
+    b.ne    1f
+    ldr     w16, [sp, #0x20]       /* kmbIdxKeySha */
+    cmp     w16, #0xfe
+    b.ne    1f
+    mov     w16, #PPR_AES_MARKER
+    str     w16, [sp, #0x18]
+    mov     w16, #PPR_SHA_MARKER
+    str     w16, [sp, #0x20]
 1:
-#if PPR_ABI == 2
-    cmp     w28, #0x7f
-#else
-    cmp     w24, #0x7f
-#endif
-    b.ne    2f
-    /*
-     * Re-enter before the stock SHA-capacity test.  The plaintext path still
-     * appends one WaitForIdmaAes command; skipping this test can leave an IDMA
-     * command staged without its terminal SHA completion when that queue is
-     * full.
-     */
-    b       precheck_normal
-2:
-    b       common_error
+    b       original_helper
 
-ppr_dispatch:
-#if PPR_ABI == 2
-    cmp     w28, #0x7f
-#else
-    cmp     w24, #0x7f
-#endif
-#if PPR_FAR_BRANCHES
-    b.eq    3f
-    b       dispatch_native
-3:
-    b       ppr_plaintext_dispatch
-#else
-    b.ne    dispatch_native
-    b       ppr_plaintext_dispatch
-    .word   0
-#endif
+.global ppr_aes_or_plaintext
+.type ppr_aes_or_plaintext, %function
+ppr_aes_or_plaintext:
+    /*
+     * Both native dispatch modes call the same descriptor producer:
+     *   x0 queue, w1 size, x2 source, w3 ZCN destination, w4 PASID,
+     *   w5 direction, w6 AES command, w7 KMB index.
+     * The stock plaintext descriptor has the same first five arguments;
+     * engine 5 is the firmware's physical-to-ZCN passthrough engine.
+     */
+    cmp     w7, #PPR_AES_MARKER
+    b.ne    2f
+    mov     w5, #5
+    b       plaintext_descriptor
+2:
+    b       aes_descriptor
+
+    .space  0x4c - (. - ppr_wrapper), 0
 
 .size ppr_wrapper, . - ppr_wrapper
 
 .section .plaintext, "ax"
 .balign 4
-.global ppr_plaintext_dispatch
-.type ppr_plaintext_dispatch, %function
+.global ppr_sha_or_noauth
+.type ppr_sha_or_noauth, %function
 
-ppr_plaintext_dispatch:
-#if PPR_FAR_BRANCHES
-    cbz     w20, 4f
-    b       common_error
-4:
-#else
-    cbnz    w20, common_error
-#endif
+.extern sha_authenticate
+.extern sha_wait_idma_aes
+.extern submit_idma_aes
+
+ppr_sha_or_noauth:
+    cmp     w7, #PPR_SHA_MARKER
+    b.ne    5f
+
     /*
-     * A package-backed source address contains the BFS/LVD LPAR in its high
-     * word.  Sending an index-only value (for example 0x00102500) as an IDMA
-     * physical source makes IOC reject opcode 0x24 and can poison unrelated
-     * storage queues until reboot.  Fail the request before appending any
-     * descriptor when the kernel mapping arrived without a container LPAR.
+     * The common helper has already appended its first queue-1
+     * WaitForIdmaAes carrying a4/source completion.  Append a second wait
+     * carrying a6/terminal completion instead of four SHA descriptors.  This
+     * preserves the independent E8 and E3 notifications used by the NSID2
+     * paths while keeping the native queue dependency and publication order.
      */
-#if PPR_ABI == 2
-    lsr     x16, x6, #32
-#else
-    lsr     x16, x26, #32
-#endif
-#if PPR_FAR_BRANCHES
-    cbnz    x16, 7f
-    b       common_error
-7:
-#else
-    cbz     x16, common_error
-#endif
-    /*
-     * Preserve the native two-stage completion protocol.  The passthrough
-     * command replaces AES and therefore carries deviceOpSource_notifyIdmaAes
-     * from w4.  A separate SHA-queue wait below carries notifySha without
-     * performing authentication.
-     */
-    mov     w3, w4
-#if PPR_ABI == 2
-    mov     x4, x6
-    mov     w5, w6
-#else
-    mov     x4, x26
-#if PPR_ABI == 0
-    mov     w5, w6
-#else
-    mov     w5, w25
-#endif
-#endif
-    mov     w6, w23
-    /*
-     * The stock package input path is the only native IdmaPt caller with
-     * this MP4-physical-source -> ZCN-buffer direction.  It selects unit 1
-     * (kZcnEnginePassthrough1), so keep the same engine here.
-     */
-    mov     w7, #1
-#if PPR_ABI == 2
-    str     x22, [sp]
-#elif PPR_ABI == 0
-    str     x25, [sp]
-#else
-    str     x28, [sp]
-#endif
-    bl      plaintext_idma
-    cbnz    w0, 5f
-    mov     w0, #0x01000000
-    b       common_return
-5:
-    /*
-     * Keep the native cross-queue dependency and second completion event, but
-     * replace SHA3-CMAC with the existing WaitForIdmaAes command.  Its command
-     * info is terminal notifySha, so both pipeline state bits are consumed in
-     * their original order.
-     */
-    mov     x0, x19
-#if PPR_ABI == 2
-    mov     x1, x26
-    ldur    w2, [x29, #-0xc]
-    mov     x3, x22
-#elif PPR_ABI == 0
-    mov     x1, x22
-    ldur    w2, [x29, #-0x54]
-    mov     x3, x25
-#else
-    mov     x1, x22
-    ldur    w2, [x29, #-0xc]
-    mov     x3, x28
-#endif
+    sub     sp, sp, #0x20
+    stp     x0, x5, [sp]
+    str     x30, [sp, #0x10]
+    mov     w2, w3                 /* terminal notifySha */
+    ldr     x3, [sp, #0x58]        /* common a18 / SHA a16 trace */
     bl      sha_wait_idma_aes
+    cbz     w0, 4f                 /* preserve the helper's queue error */
 
-    /*
-     * Preserve the stock queue-1 reservation.  WaitForIdmaAes replaces SHA,
-     * but its completion still occupies the native 0x19a-cycle slot before
-     * the selected ZCN buffer may be reused.
-     */
-#if PPR_ABI == 2
-    mov     x8, x25
-#elif PPR_ABI == 0
-    add     x8, x19, w23, uxtw #2
-#else
-    ldur    x8, [x29, #-8]
-#endif
-#if PPR_MERGED_TEXT
-    ldr     w9, [x8, #0xa38]
-    ldr     w10, [x19, #0x9f4]
-#else
-    ldr     w9, [x8, #0x524]
-    ldr     w10, [x19, #0x4fc]
-#endif
-    cmp     w10, w9
-    csel    w9, w10, w9, ge
-    add     w9, w9, #0x19a
-#if PPR_MERGED_TEXT
-    str     w9, [x19, #0x9f4]
-    str     w9, [x8, #0xac8]
-    ldrb    w10, [x19, #0x408]
-#else
-    str     w9, [x19, #0x4fc]
-    str     w9, [x8, #0x5b4]
-    ldrb    w10, [x19, #0x308]
-#endif
-    cmp     w23, w10
-    b.hs    6f
-#if PPR_MERGED_TEXT
-    str     w9, [x8, #0xa98]
-#else
-    str     w9, [x8, #0x584]
-#endif
-6:
-    /*
-     * IdmaPt is much shorter than the native AES operation and only appends a
-     * descriptor.  Arm the dependent queue before ringing queue 0 so IOC can
-     * never observe a completed producer before its waiter is visible.  This
-     * is the publish-time equivalent of the stock plaintext producer, which
-     * builds both queues before either becomes runnable.
-     */
-    mov     x0, x19
+    /* Release the ZCN buffer at the terminal wait's queue-1 cycle. */
+    ldp     x0, x5, [sp]
+    ldrh    w8, [x0, #PPR_Q1_CYCLE_OFFSET]
+    sub     w8, w8, #1
+    tbz     x5, #63, 3f
+    ldr     w9, [x0, #PPR_ZCN_CONFIG_OFFSET]
+    ubfx    w10, w9, #8, #8
+    add     w9, w10, w9, uxtb
+    ubfx    w11, w5, #16, #9
+    cmp     w9, w11
+    b.ls    3f
+    add     x10, x0, w11, uxtw #1
+    strh    w8, [x10, #PPR_ZCN_RELEASE_OFFSET]
+    mov     w10, #1
+    ldr     x9, [x0, #PPR_ZCN_RELEASE_BITS_OFFSET]
+    lsl     x8, x10, x11
+    orr     w8, w8, w9
+    bfxil   x9, x8, #0, #24
+    str     x9, [x0, #PPR_ZCN_RELEASE_BITS_OFFSET]
+3:
     mov     w1, #1
-    bl      submit_idma_aes /* submit SHA wait queue */
-    mov     x0, x19
-    mov     w1, wzr
-    bl      submit_idma_aes /* submit plaintext IDMA queue */
-    mov     w0, wzr
-    b       common_return
+    bl      submit_idma_aes
+    mov     w0, #1
+4:
+    ldr     x30, [sp, #0x10]
+    add     sp, sp, #0x20
+    ret
+5:
+    b       sha_authenticate
 
-#if !PPR_FAR_BRANCHES
-    .space  8, 0
-#endif
+    .space  0xa0 - (. - ppr_sha_or_noauth), 0
 
-.size ppr_plaintext_dispatch, . - ppr_plaintext_dispatch
+.size ppr_sha_or_noauth, . - ppr_sha_or_noauth

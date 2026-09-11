@@ -2,11 +2,14 @@
 
 **English** | [Русский](README_RU.md)
 
-This project builds a profile-driven A53 patcher with two independent
-features:
+This project builds two profile-driven A53 tools:
 
 - a dynamic per-request `NATIVE` / `PLAINTEXT_NOAUTH` PPR-PFS read selector;
-- an optional opcode-0x53 encryption KMB-whitelist bypass.
+- a standalone optional opcode-0x53 encryption KMB-whitelist bypass.
+
+The KMB tool has its own main, state machine, profile table, verifier, and
+tests. It is not linked into any `a53_ppr_*` payload, so selector install and
+status never resolve, read, classify, or change the FsWrite instruction.
 
 The selector replaces only the cryptographic part of marked 64 KiB package
 reads. Native requests still use the original A53 helper with unchanged
@@ -27,7 +30,8 @@ The detailed queue and caller analysis is available in
 - an exact-profile state machine that fails closed on unknown layouts or
   instructions;
 - AArch64 runtime and plaintext wrappers generated from one shared template;
-- console and `/dev/notification0` output for every complete log line;
+- console output plus `/dev/notification0`; payloads aggregate their log into
+  one final popup instead of issuing one syscall per line;
 - host state-machine tests and static profile/wrapper verification.
 
 ## Build
@@ -41,22 +45,34 @@ make -j2
 ```
 
 The checked-in `ppr_profiles.inc` contains all 54 archived MP4 releases from
-1.00 through 11.40. `make profiles` regenerates it from `PPR_FULL_ROOT`
+1.00 through 11.40. The separate `kmb_range_profiles.inc` contains the 31
+verified KMB layouts from 4.00 through 10.60. `make profiles` regenerates both
+tables from `PPR_FULL_ROOT`
 (`../../MP4_1.00-12.00` by default), using `PPR_DRAM_ROOT`
 (`/mnt/j/PS5Dev/mp4`) as a fallback. `make verify` independently extracts and
-checks every profile against those ELFs.
+checks every profile against those ELFs. Source labels are accepted only when
+the embedded AArch64 ELF contains the matching release marker, so a mislabeled
+full image cannot shadow the correct DRAM fallback. The available `6.00.01`,
+`7.01.01`, and `8.20.02` images are verified as exact aliases of `6.00`,
+`7.01`, and `8.20`; they share the same runtime firmware IDs and therefore do
+not create duplicate profile rows.
 
 Artifacts are written to `build/`:
 
 - `a53_ppr_patcher.elf` — argument-driven status/control payload;
-- `a53_ppr_install.elf` — install with verified batching and persistent
-  transport enabled;
-- `a53_ppr_install_fast.elf` — install using every verified fast transport;
+- `a53_ppr_install.elf` — install using the verified pair-only fast transport;
+- `a53_ppr_install_fast.elf` — compatibility-named alias with the same action
+  and transport defaults;
 - `a53_ppr_plaintext.elf` — install alias for launchers without arguments;
 - `a53_ppr_native.elf` — stock-restore alias for launchers without arguments;
 - `a53_ppr_uninstall.elf` — restore the exact stock entry instructions;
-- `a53_kmb_range_install.elf` — bypass the opcode-0x53 AES-index whitelist;
-- `a53_kmb_range_uninstall.elf` — restore its exact stock instruction.
+- `a53_kmb_range_install.elf` — standalone fixed-action payload that bypasses
+  the opcode-0x53 AES-index whitelist;
+- `a53_kmb_range_uninstall.elf` — standalone fixed-action payload that restores
+  its exact stock instruction.
+
+Deploy only these `build/` outputs. Root-level files copied from an older
+build may still contain the retired implementation and must not be reused.
 
 ## Exact profiles, not firmware assumptions
 
@@ -72,11 +88,26 @@ Addresses are data owned by a profile, not assumptions in the algorithm. For
 example only, the 9.40 profile places the shared package decrypt/auth helper at
 `0x04e5a6bc`. Other images must provide their own fully verified profile.
 
-Before a patch write, the transport also compares scalar and two-command batch
-reads and verifies two consecutive transactions through one persistent
-fd/kqueue pair. Unsupported optimizations are disabled while verified
-fallbacks remain available. Mixed write/readback packets are used only after
-the batch ABI has been validated.
+Before a patch write, the transport compares a scalar read with a sixteen-
+command read-only batch and verifies two consecutive transactions through one
+persistent fd/kqueue pair. The maximum read envelope covers the 15-command
+preflight without a synthetic A53 write. Production mutations are deliberately
+limited to the packet shape proven by the working fast path: two writes followed
+by their two exact readbacks. The newer eight-write grouping is not exposed to
+the state machine. Unsupported optimizations are disabled while verified
+fallbacks remain available. Every response is bounded by its complete
+DECI5S/SDBGP envelope and must echo the current request sequence; stale result
+records left by an earlier, longer packet are rejected.
+
+For a clean fixed-action install, GET_CONF costs one transaction. A successful
+capability probe then costs two transactions and one open, whose descriptor is
+retained. The clean install uses another eleven transactions: one layout
+snapshot, one exact 15-site preflight, one paired cave write/readback, three
+transactions for the three internal hooks (one pair plus one scalar
+write/readback), and five paired transactions for the ten public callers. The
+normal path is therefore fourteen DECI5S requests in total, in addition to the
+one-time mailbox discovery handshake. FsWrite/KMB is absent from every one of
+these reads and writes.
 
 ## Command line
 
@@ -86,8 +117,6 @@ the batch ABI has been validated.
 --uninstall --idle
 --mode native --idle
 --mode plaintext-noauth --idle
---kmb-range-install --idle
---kmb-range-uninstall --idle
 --fast --persistent --batch --mixed-io
 --conservative
 ```
@@ -97,11 +126,13 @@ the batch ABI has been validated.
 `--install` installs the dynamic selector; `--uninstall` restores exact stock
 entry instructions. The two `--mode` commands are compatibility aliases:
 `plaintext-noauth` installs the same dynamic selector, while `native` removes
-it. They do not set a persistent global mode.
+it. They do not set a persistent global mode. Mutating actions selected through
+the argument-driven payload also default to all verified fast transports;
+`--conservative` explicitly disables them.
 
-`--status` is read-only. It reports selector state, resolved cave addresses,
-the independent KMB-range state when that guard exists, and transport
-counters. It succeeds for a complete stock or installed selector image.
+`--status` is read-only. It reports only selector state, resolved cave
+addresses, and transport counters. It succeeds for a complete stock or
+installed selector image.
 
 ## Read-path coverage
 
@@ -127,18 +158,19 @@ plaintext sentinel.
 
 ## Per-request selector
 
-The wrapper reads `kmbIdxKeyAes` from `[sp+0x18]`:
+The wrapper loads the complete 32-bit `kmbIdxKeyAes` and `kmbIdxKeySha`
+arguments from `[sp+0x18]` and `[sp+0x20]`. It selects
+`PLAINTEXT_NOAUTH` only for the exact kernel-published pair
+`AES=0x000000ff, SHA=0x000000fe`; every other request tail-calls the original
+helper unchanged.
 
-- any allocatable AES index tail-calls the original helper unchanged;
-- the private invalid AES index `0xff` selects `PLAINTEXT_NOAUTH` and becomes
-  internal encryption type `0x7f`.
-
-A signed outer PFS normally supplies `SHA=0xfe, AES=0xff`, while an unsigned
-inner PFS may omit the SHA key and retain only the AES sentinel. Dispatch
-therefore depends on `AES == 0xff`, not on an exact `fe/ff` pair. Passing
-`0xff` to the stock path is not valid: the helper immediately emits
-`IdmaDecrypt`, and IOC rejects the non-allocatable index with
-`ILLEGAL_KMB_ACCESS`.
+The fields are nine bits wide in A53. Byte-only matching is unsafe because a
+real key slot can have the same low byte, and AES-only matching also catches
+native requests. The kernel outer and inner NAPS read builders both propagate
+the complete pair, so an unsigned inner PFS does not require a relaxed
+selector. After the exact match, private `0x7ff` / `0x7fe` values carry the
+selection through the stock helper; they are outside the native nine-bit KMB
+range and are consumed by the internal hooks before descriptor encoding.
 
 The sentinel must be installed by matching kernel-side mount logic only for a
 validated plaintext mount. Adding an A53 profile does not add or authorize the
@@ -155,56 +187,85 @@ WaitForBufferFree
   -> caller-specific consumer
 ```
 
-For `PLAINTEXT_NOAUTH`, the wrapper retains the stock wait, SHA-queue capacity
-check, selected input/output buffer, dependency, PASID, prediction state, and
-both completion events. It also rejects a package source whose physical
-address lacks a non-zero BFS/LVD LPAR before appending any descriptor.
+For `PLAINTEXT_NOAUTH`, the original common helper and native dispatch retain
+control of buffer selection, capacity checks, continuation, completion-table
+updates, clocks, and queue-0 publication. The two AES-builder hooks replace
+only a marked AES data descriptor with the firmware's own physical-to-ZCN
+plaintext descriptor.
 
 ```text
-IdmaPt(passthrough unit 1, queue 0, native IDMA/AES notify)
-  -> WaitForIdmaAes(queue 1, native terminal SHA notify)
-  -> preserve max(lastSha, IdmaPt) + 0x19a and buffer watermarks
+stock common helper / native dispatch
+  -> queue-0 setup descriptor, completion a4
+  -> IdmaPt(engine 5 / unit 0, queue 0, completion a5)
+  -> stock queue-0 bookkeeping and submit
+  -> stock queue-1 WaitForIdmaAes, completion a4
+  -> terminal WaitForIdmaAes, completion a6
+  -> publish per-buffer q1 release id and low-24 dependency mask
   -> submit queue 1
-  -> submit queue 0
 ```
 
-No AES-XTS or SHA3-CMAC command is emitted for the marked read. Queue 1 is
-armed before the short queue-0 producer so that its waiter is visible before
-IDMA can complete. Passthrough unit 1 is the stock engine for the
-MP4-physical-source to ZCN-buffer direction; it must not be confused with the
-queue number.
+No marked AES-XTS or SHA3-CMAC descriptor reaches hardware. Keeping `a5` and
+`a6` independent is essential: `a5` completes an NVM internal-buffer command,
+while `a6` is the terminal read notification. The q1 release entry and mask
+prevent later queue-0 reuse from overtaking that terminal wait.
 
 ## Independent KMB-range extension
 
-`--kmb-range-install` changes only
-`FlashWriteEncryptAndCalculateSha` (opcode `0x53`). It redirects only the
-out-of-range rejection branch to the native success block; the stock
-per-index filter inside its original range is unchanged. Opcode
-`0x53` still has 8-bit AES/SHA fields, so its callers are limited to slots
-0..255 and an XTS base no greater than 254.
+`a53_kmb_range_install.elf` changes only
+`FlashWriteEncryptAndCalculateSha` (opcode `0x53`): it replaces the exact
+`b.hi` rejection at the profiled site with an unconditional branch to
+`site+0x24`. This skips that range/bitmask classification and forces its stock
+permitted path for every request. Only this one instruction changes; all code
+and checks downstream of the permitted path remain stock. The AES base is
+still extracted as an 8-bit field, so slots remain 0..255 and an XTS base may
+not exceed 254.
 
-The ExtFs encryption range instruction is not read, changed, or restored by
-this payload.
+No `a53_ppr_*` selector payload reads, changes, or restores this FsWrite
+instruction; only the two standalone `a53_kmb_range_*` payloads touch it.
 
-This operation neither installs nor removes the read selector. It is accepted
-only when the current instruction exactly matches the known stock or patched
-word, and every write is read back. `--kmb-range-uninstall` restores the exact
-profile-specific stock instruction. The independently patchable guard exists
-in the 4.x through 10.x ABI; the KMB-range commands fail as unsupported on
-1.x through 3.x and 11.x, without affecting selector support.
+This operation neither installs nor removes the read selector. Its binary does
+not link `ppr_patch.c`. It validates one exact DEV-layout snapshot, performs
+one instruction-state read, and only when a change is needed performs one
+write plus one readback. The current word must exactly match the profile's
+stock or patched word. `a53_kmb_range_uninstall.elf` restores the exact
+profile-specific stock instruction. The standalone table covers all 31
+archived 4.00-through-10.60 profiles; 1.x through 3.x and 11.x fail as
+unsupported before any write, without affecting selector support.
+If the mutation readback fails, the payload makes a best-effort exact restore
+of the prior instruction and verifies that rollback before returning failure.
+An unconfirmed standalone timeout is likewise reconciled by a fresh state
+read; an unverified restore reports `KMB_ROLLBACK_REBOOT_REQUIRED`.
 
 ## Patch-state safety
 
-Installation writes dormant cave code first, connects the two internal helper
+Installation writes dormant cave code first, connects the three internal helper
 hooks next, and redirects the ten public callers last. Removal disconnects the
-public callers before restoring the internal sites. Every write is verified
-by readback and the complete final state is reread.
+public callers before restoring the internal sites. Every mutation is verified
+immediately by exact readback. Because a transport timeout does not prove that
+A53 skipped a write, the failure path first performs a fresh exact read and
+accepts an already-applied desired value. Rollback is phase-ordered and
+verified; if the public callers cannot be confirmed stock, internal hooks are
+deliberately left intact and the payload reports `ROLLBACK_REBOOT_REQUIRED`.
+The fast action preflight batches all thirteen
+current and two retired entry words in one 15-command transaction. A clean
+stock install does not read stale cave bytes which it will overwrite; caves are
+read only to classify an exact current hooked/mixed state. No redundant final
+full-state snapshot is issued after all checked writes succeed.
 
-An interrupted transaction is recoverable only when both current trampolines
-are complete and every entry word is an exact stock/current value. Unknown
-connected bytes are never repaired speculatively. The opcode-0x53 KMB
-instruction has the same exact stock/patched policy but remains a separate
-state.
+State validation also reads the retired precheck and dispatch hook sites used
+by the previous patch generation. A state is current stock or current installed
+only when both retired sites contain their exact stock words. Exact old branch
+targets are reported as `LEGACY_REBOOT_REQUIRED`; install and uninstall both
+stop before their first write. The current payload never repairs, migrates, or
+overwrites either retired site. Reboot into a known-stock A53 image (or use the
+matching old uninstaller in its validated environment) before applying the
+current patch. An unknown word at either retired site is also fail-closed.
+
+An interrupted current transaction is recoverable only when both current
+trampolines are complete, every current entry word is an exact stock/current
+value, and both retired sites are exact stock. Unknown connected bytes are
+never repaired speculatively. FsWrite KMB state is not part of this state
+machine and is handled only by the standalone payloads.
 
 ## Verification
 
@@ -213,14 +274,18 @@ make verify
 make host-test
 ```
 
-`make verify` checks all 54 supplied A53 ELFs, all twelve patch sites and
-branch targets, helper/IdmaPt/submit ABIs, executable-tail placement, the
-available opcode-0x53 KMB guards, and byte-for-byte equality of C-generated
-and assembled legacy/current/late wrappers.
+`make verify` checks all 54 supplied A53 ELFs, the three patch-version aliases,
+all thirteen selector sites and
+branch targets, the native AES and stock plaintext descriptor builders, the
+terminal SHA release/submit layout, executable-tail placement, exact FE/FF
+selector semantics, and byte-for-byte equality of C-generated and assembled
+wrappers. Its separate KMB verifier checks the exact 20-word FsWrite context,
+DEV layout, site, stock word, and replacement branch for all 31 KMB profiles.
 
 `make host-test` exercises status, idle gating, install, interrupted-state
-recovery, uninstall, independent KMB install/uninstall, unknown-instruction
-rejection, and unsupported-profile rejection with a mock A53 layout.
+recovery, uninstall, unknown-instruction rejection, and unsupported-profile
+rejection for the selector. A separate standalone test exercises KMB
+install/uninstall, exact-layout rejection, unknown words, and readback failure.
 
 On a console, verify `--status` after a reboot and complete queue drain. Test a
 known-good native package before a marked plaintext package, then repeat

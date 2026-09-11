@@ -6,11 +6,14 @@
 #include <string.h>
 
 #define PPR_CALL_COUNT 10U
-#define PPR_SITE_COUNT (PPR_CALL_COUNT + 2U)
+#define PPR_AES_SITE_COUNT 2U
+#define PPR_LEGACY_SITE_COUNT 2U
+#define PPR_SITE_COUNT (PPR_CALL_COUNT + PPR_AES_SITE_COUNT + 1U)
 #define PPR_RUNTIME_SIZE 0x4cU
 #define PPR_PLAINTEXT_SIZE 0xa0U
 #define PPR_LAYOUT_HEADER_SIZE 0x148U
 #define PPR_LAYOUT_MAX_SEGMENTS 32U
+#define PPR_MIXED_WRITE_MAX 8U
 
 struct ppr_layout_record {
     uint32_t id;
@@ -56,25 +59,21 @@ struct ppr_profile {
     uint64_t precheck_special_va;
     uint64_t common_error_va;
     uint64_t dispatch_native_va;
+    uint64_t aes_descriptor_va;
+    uint64_t plaintext_descriptor_va;
+    uint64_t plaintext_direct_va;
     uint64_t plaintext_idma_va;
     uint64_t sha_wait_idma_aes_va;
+    uint64_t sha_authenticate_va;
     uint64_t submit_idma_va;
     uint64_t common_return_va;
 
-    /*
-     * FlashWriteEncryptAndCalculateSha (opcode 0x53) has a second, unrelated
-     * whitelist for the 8-bit AES base index encoded in its command header.
-     * Redirect only the out-of-range rejection to the native success path;
-     * the stock per-index filter inside its original range remains intact.
-     * The command format still limits AES/SHA indices to 0..255 and callers
-     * must keep the AES-XTS pair within that aperture.
-     */
-    uint64_t fswrite_kmb_range_va;
-    uint32_t fswrite_kmb_range_stock;
-    uint32_t fswrite_kmb_range_patch;
-
     uint64_t call_va[PPR_CALL_COUNT];
     uint32_t call_stock[PPR_CALL_COUNT];
+    uint64_t aes_site_va[PPR_AES_SITE_COUNT];
+    uint32_t aes_site_stock[PPR_AES_SITE_COUNT];
+    uint64_t sha_auth_site_va;
+    uint32_t sha_auth_site_stock;
     uint64_t precheck_va;
     uint32_t precheck_stock;
     uint64_t dispatch_va;
@@ -101,31 +100,33 @@ struct ppr_images {
     uint32_t runtime[PPR_RUNTIME_SIZE / 4U];
     uint32_t plaintext[PPR_PLAINTEXT_SIZE / 4U];
     uint32_t site_hook[PPR_SITE_COUNT];
+    uint32_t legacy_hook[PPR_LEGACY_SITE_COUNT];
 };
 
 struct ppr_resolved {
     uint64_t runtime_cave;
     uint64_t plaintext_cave;
-    uint64_t fswrite_kmb_range;
     uint64_t site[PPR_SITE_COUNT];
+    uint64_t legacy_site[PPR_LEGACY_SITE_COUNT];
 };
 
 struct ppr_state {
     uint8_t runtime[PPR_RUNTIME_SIZE];
     uint8_t plaintext[PPR_PLAINTEXT_SIZE];
-    uint32_t fswrite_kmb_range;
     uint32_t site[PPR_SITE_COUNT];
+    uint32_t legacy_site[PPR_LEGACY_SITE_COUNT];
     int runtime_exact;
     int plaintext_exact;
     int sites_known;
     int sites_stock;
     int sites_hooked;
+    int legacy_sites_known;
+    int legacy_sites_stock;
+    int legacy_hook_present;
+    int legacy_reboot_required;
     int native;
     int dynamic;
     int recoverable;
-    int fswrite_kmb_range_known;
-    int fswrite_kmb_range_stock;
-    int fswrite_kmb_range_patched;
 };
 
 struct ppr_context {
@@ -166,83 +167,37 @@ static int ppr_encode_branch26(uint32_t opcode, uint64_t from, uint64_t to,
     return 0;
 }
 
-static int ppr_encode_imm19(uint32_t instruction, uint64_t from, uint64_t to,
-                            uint32_t *result) {
-    int64_t delta = (int64_t)to - (int64_t)from;
-    if (!result || (delta & 3) != 0 || delta < -0x00100000LL ||
-        delta > 0x000ffffcLL)
-        return -1;
-    *result = (instruction & ~0x00ffffe0U) |
-              (((uint32_t)(delta / 4) & 0x7ffffU) << 5);
-    return 0;
-}
-
 static int ppr_build_images(struct ppr_context *ctx) {
     const struct ppr_profile *p = ctx->profile;
-    int far = p->cave_in_dev && !p->merged_text;
 
     static const uint32_t runtime_template[PPR_RUNTIME_SIZE / 4U] = {
-        0x394063f0U, 0x7103fe1fU, 0x54000080U, 0xd503201fU,
-        0xd503201fU, 0U, 0x52800ff0U, 0xb90013f0U, 0U,
-        0x35000058U, 0U, 0x7101ff1fU, 0x54000041U, 0U, 0U,
-        0x7101ff1fU, 0U, 0U, 0U,
+        0xb9401bf0U, 0x7103fe1fU, 0x54000101U, 0xb94023f0U,
+        0x7103fa1fU, 0x540000a1U, 0x5280fff0U, 0xb9001bf0U,
+        0x5280ffd0U, 0xb90023f0U, 0U, 0x711ffcffU,
+        0x54000061U, 0x528000a5U, 0U, 0U,
+        0U, 0U, 0U,
     };
     static const uint32_t plaintext_template[PPR_PLAINTEXT_SIZE / 4U] = {
-        0U, 0xd360ff50U, 0U, 0x2a0403e3U,
-        0xaa1a03e4U, 0x2a1903e5U, 0x2a1703e6U, 0x52800027U,
-        0xf90003fcU, 0U, 0x35000060U, 0x52a02000U,
-        0U, 0xaa1303e0U, 0xaa1603e1U, 0xb85f43a2U,
-        0xaa1c03e3U, 0U, 0xf85f83a8U, 0xb9452509U,
-        0xb944fe6aU, 0x6b09015fU, 0x1a89a149U, 0x11066929U,
-        0xb904fe69U, 0xb905b509U, 0x394c226aU, 0x6b0a02ffU,
-        0x54000042U, 0xb9058509U, 0xaa1303e0U, 0x52800021U,
-        0U, 0xaa1303e0U, 0x2a1f03e1U, 0U,
-        0x2a1f03e0U, 0U,
-    };
-    static const uint32_t legacy_far_template[PPR_PLAINTEXT_SIZE / 4U] = {
-        0x34000054U, 0U, 0xd360ff50U, 0xb5000050U,
-        0U, 0x2a0403e3U, 0xaa1a03e4U, 0x2a0603e5U,
-        0x2a1703e6U, 0x52800027U, 0xf90003f9U, 0U,
-        0x35000060U, 0x52a02000U, 0U, 0xaa1303e0U,
-        0xaa1603e1U, 0xb85ac3a2U, 0xaa1903e3U, 0U,
-        0x8b374a68U, 0xb9452509U, 0xb944fe6aU, 0x6b09015fU,
-        0x1a89a149U, 0x11066929U, 0xb904fe69U, 0xb905b509U,
-        0x394c226aU, 0x6b0a02ffU, 0x54000042U, 0xb9058509U,
-        0xaa1303e0U, 0x52800021U, 0U, 0xaa1303e0U,
-        0x2a1f03e1U, 0U, 0x2a1f03e0U, 0U,
+        0x711ff8ffU, 0x54000401U, 0xd10083ffU, 0xa90017e0U,
+        0xf9000bfeU, 0x2a0303e2U, 0xf9402fe3U, 0U,
+        0x340002c0U, 0xa94017e0U, 0x79402808U, 0x51000508U,
+        0xb6f801e5U, 0xb9430809U, 0x53083d2aU, 0x0b290149U,
+        0x531060abU, 0x6b0b013fU, 0x54000129U, 0x8b2b440aU,
+        0x7906c148U, 0x5280002aU, 0xf9422c09U, 0x9acb2148U,
+        0x2a090108U, 0xb3405d09U, 0xf9022c09U, 0x52800021U,
+        0U, 0x52800020U, 0xf9400bfeU, 0x910083ffU,
+        0xd65f03c0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U,
     };
     memcpy(ctx->images.runtime, runtime_template, sizeof(runtime_template));
-    memcpy(ctx->images.plaintext,
-           far ? legacy_far_template : plaintext_template,
+    memcpy(ctx->images.plaintext, plaintext_template,
            sizeof(ctx->images.plaintext));
 
-    if (far && p->abi != PPR_ABI_LEGACY)
-        return -1;
-    if (p->abi == PPR_ABI_LATE) {
-        ctx->images.runtime[9] = 0x3500005cU;  /* cbnz w28 */
-        ctx->images.runtime[11] = 0x7101ff9fU; /* cmp w28, #0x7f */
-        ctx->images.runtime[15] = 0x7101ff9fU;
-        ctx->images.plaintext[1] = 0xd360fcd0U; /* lsr x16, x6, #32 */
-        ctx->images.plaintext[4] = 0xaa0603e4U; /* mov x4, x6 */
-        ctx->images.plaintext[5] = 0x2a0603e5U; /* mov w5, w6 */
-        ctx->images.plaintext[8] = 0xf90003f6U; /* str x22, [sp] */
-        ctx->images.plaintext[14] = 0xaa1a03e1U; /* mov x1, x26 */
-        ctx->images.plaintext[16] = 0xaa1603e3U; /* mov x3, x22 */
-        ctx->images.plaintext[18] = 0xaa1903e8U; /* mov x8, x25 */
-    } else if (p->abi == PPR_ABI_LEGACY && !far) {
-        ctx->images.plaintext[5] = 0x2a0603e5U; /* mov w5, w6 */
-        ctx->images.plaintext[8] = 0xf90003f9U; /* str x25, [sp] */
-        ctx->images.plaintext[15] = 0xb85ac3a2U; /* ldur w2, [x29, #-0x54] */
-        ctx->images.plaintext[16] = 0xaa1903e3U; /* mov x3, x25 */
-        ctx->images.plaintext[18] = 0x8b374a68U; /* queue pointer */
-        if (p->merged_text) {
-            ctx->images.plaintext[19] = 0xb94a3909U;
-            ctx->images.plaintext[20] = 0xb949f66aU;
-            ctx->images.plaintext[24] = 0xb909f669U;
-            ctx->images.plaintext[25] = 0xb90ac909U;
-            ctx->images.plaintext[26] = 0x3950226aU;
-            ctx->images.plaintext[29] = 0xb90a9909U;
-        }
+    if (p->merged_text) {
+        ctx->images.plaintext[10] = 0x79404408U; /* q1 cycle +0x22 */
+        ctx->images.plaintext[13] = 0xb9440809U; /* ZCN config +0x408 */
+        ctx->images.plaintext[20] = 0x7908c148U; /* release +0x460 */
+        ctx->images.plaintext[22] = 0xf9430009U; /* mask +0x600 */
+        ctx->images.plaintext[26] = 0xf9030009U;
     }
 
 #define B26(array, base, index, opcode, target)                                \
@@ -252,70 +207,18 @@ static int ppr_build_images(struct ppr_context *ctx) {
                 (target), &(array)[index]) != 0)                                \
             return -1;                                                          \
     } while (0)
-#define I19(array, base, index, instruction, target)                            \
-    do {                                                                        \
-        if (ppr_encode_imm19((instruction),                                     \
-                (base) + (uint64_t)(index) * 4U,                                \
-                (target), &(array)[index]) != 0)                                \
-            return -1;                                                          \
-    } while (0)
-
-    B26(ctx->images.runtime, p->runtime_cave_va, 5,
-        0x14000000U, p->helper_va);
-    B26(ctx->images.runtime, p->runtime_cave_va, 8,
-        0x14000000U, p->helper_va);
     B26(ctx->images.runtime, p->runtime_cave_va, 10,
-        0x14000000U, p->precheck_normal_va);
-    B26(ctx->images.runtime, p->runtime_cave_va, 13,
-        0x14000000U, p->precheck_normal_va);
+        0x14000000U, p->helper_va);
     B26(ctx->images.runtime, p->runtime_cave_va, 14,
-        0x14000000U, p->common_error_va);
-    if (far) {
-        ctx->images.runtime[16] = 0x54000040U; /* b.eq runtime + 0x48 */
-        B26(ctx->images.runtime, p->runtime_cave_va, 17,
-            0x14000000U, p->dispatch_native_va);
-        B26(ctx->images.runtime, p->runtime_cave_va, 18,
-            0x14000000U, p->plaintext_cave_va);
-
-        B26(ctx->images.plaintext, p->plaintext_cave_va, 1,
-            0x14000000U, p->common_error_va);
-        B26(ctx->images.plaintext, p->plaintext_cave_va, 4,
-            0x14000000U, p->common_error_va);
-        B26(ctx->images.plaintext, p->plaintext_cave_va, 11,
-            0x94000000U, p->plaintext_idma_va);
-        B26(ctx->images.plaintext, p->plaintext_cave_va, 14,
-            0x14000000U, p->common_return_va);
-        B26(ctx->images.plaintext, p->plaintext_cave_va, 19,
-            0x94000000U, p->sha_wait_idma_aes_va);
-        B26(ctx->images.plaintext, p->plaintext_cave_va, 34,
-            0x94000000U, p->submit_idma_va);
-        B26(ctx->images.plaintext, p->plaintext_cave_va, 37,
-            0x94000000U, p->submit_idma_va);
-        B26(ctx->images.plaintext, p->plaintext_cave_va, 39,
-            0x14000000U, p->common_return_va);
-    } else {
-        I19(ctx->images.runtime, p->runtime_cave_va, 16,
-            0x54000001U, p->dispatch_native_va);
-        B26(ctx->images.runtime, p->runtime_cave_va, 17,
-            0x14000000U, p->plaintext_cave_va);
-
-        I19(ctx->images.plaintext, p->plaintext_cave_va, 0,
-            0x35000014U, p->common_error_va);
-        I19(ctx->images.plaintext, p->plaintext_cave_va, 2,
-            0xb4000010U, p->common_error_va);
-        B26(ctx->images.plaintext, p->plaintext_cave_va, 9,
-            0x94000000U, p->plaintext_idma_va);
-        B26(ctx->images.plaintext, p->plaintext_cave_va, 12,
-            0x14000000U, p->common_return_va);
-        B26(ctx->images.plaintext, p->plaintext_cave_va, 17,
-            0x94000000U, p->sha_wait_idma_aes_va);
-        B26(ctx->images.plaintext, p->plaintext_cave_va, 32,
-            0x94000000U, p->submit_idma_va);
-        B26(ctx->images.plaintext, p->plaintext_cave_va, 35,
-            0x94000000U, p->submit_idma_va);
-        B26(ctx->images.plaintext, p->plaintext_cave_va, 37,
-            0x14000000U, p->common_return_va);
-    }
+        0x14000000U, p->plaintext_descriptor_va);
+    B26(ctx->images.runtime, p->runtime_cave_va, 15,
+        0x14000000U, p->aes_descriptor_va);
+    B26(ctx->images.plaintext, p->plaintext_cave_va, 7,
+        0x94000000U, p->sha_wait_idma_aes_va);
+    B26(ctx->images.plaintext, p->plaintext_cave_va, 28,
+        0x94000000U, p->submit_idma_va);
+    B26(ctx->images.plaintext, p->plaintext_cave_va, 33,
+        0x14000000U, p->sha_authenticate_va);
 
     for (size_t i = 0; i < PPR_CALL_COUNT; i++) {
         if (ppr_encode_branch26(0x94000000U, p->call_va[i],
@@ -323,22 +226,38 @@ static int ppr_build_images(struct ppr_context *ctx) {
                                 &ctx->images.site_hook[i]) != 0)
             return -1;
     }
+    for (size_t i = 0; i < PPR_AES_SITE_COUNT; i++) {
+        if (ppr_encode_branch26(
+                0x94000000U, p->aes_site_va[i],
+                p->runtime_cave_va + 0x2cU,
+                &ctx->images.site_hook[PPR_CALL_COUNT + i]) != 0)
+            return -1;
+    }
+    if (ppr_encode_branch26(
+            0x94000000U, p->sha_auth_site_va, p->plaintext_cave_va,
+            &ctx->images.site_hook[PPR_CALL_COUNT + PPR_AES_SITE_COUNT]) != 0)
+        return -1;
+
+    /* Exact hooks emitted by the previous dynamic-patch generation.  They are
+     * read-only guards outside the current site array: an exact old target is
+     * reported as LEGACY_REBOOT_REQUIRED, and no current action writes either
+     * retired site. */
     if (ppr_encode_branch26(0x94000000U, p->precheck_va,
                             p->runtime_cave_va + 0x24U,
-                            &ctx->images.site_hook[PPR_CALL_COUNT]) != 0 ||
+                            &ctx->images.legacy_hook[0]) != 0 ||
         ppr_encode_branch26(0x94000000U, p->dispatch_va,
                             p->runtime_cave_va + 0x3cU,
-                            &ctx->images.site_hook[PPR_CALL_COUNT + 1U]) != 0)
+                            &ctx->images.legacy_hook[1]) != 0)
         return -1;
 
 #undef B26
-#undef I19
     return 0;
 }
 
 static int ppr_read(const struct ppr_context *ctx, uint64_t pa, void *dst,
                     uint32_t size) {
-    return ctx->transport->read(ctx->transport->context, pa, dst, size) > 0
+    return ctx->transport->read(ctx->transport->context, pa, dst, size) ==
+                   (int)size
                ? 0 : -1;
 }
 
@@ -396,6 +315,8 @@ static int ppr_read_layout(const struct ppr_context *ctx,
             records[i].sram_size >= p->io_mapped_size &&
             records[i].mapped_base == p->io_mapped_base &&
             records[i].mapped_size == p->io_mapped_size) {
+            if (have_io)
+                goto out;
             *io = records[i];
             have_io = 1;
         }
@@ -406,6 +327,8 @@ static int ppr_read_layout(const struct ppr_context *ctx,
             records[i].sram_base == 0 && records[i].sram_size == 0 &&
             records[i].mapped_base == p->dev_mapped_base &&
             records[i].mapped_size == p->dev_mapped_size) {
+            if (have_dev)
+                goto out;
             *dev = records[i];
             have_dev = 1;
         }
@@ -475,10 +398,7 @@ static int ppr_resolve(const struct ppr_context *ctx,
                              &resolved->plaintext_cave)
         : ppr_map_sram(cave, p->plaintext_cave_va, PPR_PLAINTEXT_SIZE,
                        &resolved->plaintext_cave);
-    if (runtime_mapped != 0 || plaintext_mapped != 0 ||
-        (p->fswrite_kmb_range_va != 0 &&
-         ppr_map_g6(&dev, p->fswrite_kmb_range_va, 4,
-                    &resolved->fswrite_kmb_range) != 0))
+    if (runtime_mapped != 0 || plaintext_mapped != 0)
         return -1;
 
     for (size_t i = 0; i < PPR_CALL_COUNT; i++) {
@@ -495,18 +415,35 @@ static int ppr_resolve(const struct ppr_context *ctx,
             return -1;
         }
     }
-    int precheck_mapped = p->merged_text
-        ? ppr_map_g6(&dev, p->precheck_va, 4,
-                     &resolved->site[PPR_CALL_COUNT])
-        : ppr_map_sram(&io, p->precheck_va, 4,
-                       &resolved->site[PPR_CALL_COUNT]);
-    int dispatch_mapped = p->merged_text
-        ? ppr_map_g6(&dev, p->dispatch_va, 4,
-                     &resolved->site[PPR_CALL_COUNT + 1U])
-        : ppr_map_sram(&io, p->dispatch_va, 4,
-                       &resolved->site[PPR_CALL_COUNT + 1U]);
-    if (precheck_mapped != 0 || dispatch_mapped != 0)
+    for (size_t i = 0; i < PPR_AES_SITE_COUNT; i++) {
+        int mapped = p->merged_text
+            ? ppr_map_g6(&dev, p->aes_site_va[i], 4,
+                         &resolved->site[PPR_CALL_COUNT + i])
+            : ppr_map_sram(&io, p->aes_site_va[i], 4,
+                           &resolved->site[PPR_CALL_COUNT + i]);
+        if (mapped != 0)
+            return -1;
+    }
+    int sha_mapped = p->merged_text
+        ? ppr_map_g6(&dev, p->sha_auth_site_va, 4,
+                     &resolved->site[PPR_CALL_COUNT + PPR_AES_SITE_COUNT])
+        : ppr_map_sram(&io, p->sha_auth_site_va, 4,
+                       &resolved->site[PPR_CALL_COUNT + PPR_AES_SITE_COUNT]);
+    if (sha_mapped != 0)
         return -1;
+
+    const uint64_t legacy_va[PPR_LEGACY_SITE_COUNT] = {
+        p->precheck_va, p->dispatch_va,
+    };
+    for (size_t i = 0; i < PPR_LEGACY_SITE_COUNT; i++) {
+        int mapped = p->merged_text
+            ? ppr_map_g6(&dev, legacy_va[i], 4,
+                         &resolved->legacy_site[i])
+            : ppr_map_sram(&io, legacy_va[i], 4,
+                           &resolved->legacy_site[i]);
+        if (mapped != 0)
+            return -1;
+    }
 
     ppr_logf(ctx, "[+] PPR %s addresses resolved from exact runtime layout",
              p->name);
@@ -525,95 +462,30 @@ static int ppr_resolve(const struct ppr_context *ctx,
 static uint32_t ppr_stock_site(const struct ppr_profile *p, size_t index) {
     if (index < PPR_CALL_COUNT)
         return p->call_stock[index];
-    if (index == PPR_CALL_COUNT)
-        return p->precheck_stock;
-    return p->dispatch_stock;
+    index -= PPR_CALL_COUNT;
+    if (index < PPR_AES_SITE_COUNT)
+        return p->aes_site_stock[index];
+    return p->sha_auth_site_stock;
 }
 
-static int ppr_kmb_supported(const struct ppr_context *ctx) {
-    return ctx->profile->fswrite_kmb_range_va != 0;
+static const char *ppr_site_name(size_t index) {
+    static const char *const internal_names[] = {
+        "segmented AES descriptor",
+        "full-block AES descriptor",
+        "terminal SHA authenticate",
+    };
+    return index < PPR_CALL_COUNT
+        ? ppr_call_names[index]
+        : internal_names[index - PPR_CALL_COUNT];
 }
 
-static void ppr_classify_kmb_state(const struct ppr_context *ctx,
-                                   struct ppr_state *state) {
-    if (!ppr_kmb_supported(ctx)) {
-        state->fswrite_kmb_range_known = 1;
-        state->fswrite_kmb_range_stock = 1;
-        return;
-    }
-    state->fswrite_kmb_range_stock = state->fswrite_kmb_range ==
-                                     ctx->profile->fswrite_kmb_range_stock;
-    state->fswrite_kmb_range_patched = state->fswrite_kmb_range ==
-                                       ctx->profile->fswrite_kmb_range_patch;
-    state->fswrite_kmb_range_known = state->fswrite_kmb_range_stock ||
-                                     state->fswrite_kmb_range_patched;
+static uint32_t ppr_legacy_stock_site(const struct ppr_profile *p,
+                                      size_t index) {
+    return index == 0 ? p->precheck_stock : p->dispatch_stock;
 }
 
-static int ppr_read_kmb_state(const struct ppr_context *ctx,
-                              const struct ppr_resolved *resolved,
-                              struct ppr_state *state) {
-    memset(state, 0, sizeof(*state));
-    /*
-     * Keep the mutation payload on scalar transactions.  Besides avoiding a
-     * full unrelated selector-state read, this never emits the 16-command
-     * SDBGP packet used by the general status path.
-     */
-    if (ppr_read(ctx, resolved->fswrite_kmb_range,
-                 &state->fswrite_kmb_range, 4) != 0)
-        return -1;
-    ppr_classify_kmb_state(ctx, state);
-    return 0;
-}
-
-static int ppr_read_state(const struct ppr_context *ctx,
-                          const struct ppr_resolved *resolved,
-                          struct ppr_state *state) {
-    memset(state, 0, sizeof(*state));
-
-    if (ctx->transport->fast_mode && ctx->transport->batch_enabled &&
-        ctx->transport->read_many) {
-        uint64_t addresses[3 + PPR_SITE_COUNT];
-        uint32_t sizes[3 + PPR_SITE_COUNT];
-        void *destinations[3 + PPR_SITE_COUNT];
-        size_t n = 0;
-#define STATE_READ(address, size, destination) do { \
-        addresses[n] = (address);                  \
-        sizes[n] = (size);                         \
-        destinations[n] = (destination);           \
-        n++;                                        \
-    } while (0)
-        STATE_READ(resolved->runtime_cave, PPR_RUNTIME_SIZE, state->runtime);
-        STATE_READ(resolved->plaintext_cave, PPR_PLAINTEXT_SIZE,
-                   state->plaintext);
-        if (ppr_kmb_supported(ctx))
-            STATE_READ(resolved->fswrite_kmb_range, 4,
-                       &state->fswrite_kmb_range);
-        for (size_t i = 0; i < PPR_SITE_COUNT; i++)
-            STATE_READ(resolved->site[i], 4, &state->site[i]);
-#undef STATE_READ
-        if (ctx->transport->read_many(ctx->transport->context, addresses,
-                                      sizes, destinations, (uint32_t)n) != 0)
-            return -1;
-    } else {
-        if (ppr_read(ctx, resolved->runtime_cave, state->runtime,
-                     sizeof(state->runtime)) != 0 ||
-            ppr_read(ctx, resolved->plaintext_cave, state->plaintext,
-                     sizeof(state->plaintext)) != 0 ||
-            (ppr_kmb_supported(ctx) &&
-             ppr_read(ctx, resolved->fswrite_kmb_range,
-                      &state->fswrite_kmb_range, 4) != 0))
-            return -1;
-        for (size_t i = 0; i < PPR_SITE_COUNT; i++) {
-            if (ppr_read(ctx, resolved->site[i], &state->site[i], 4) != 0)
-                return -1;
-        }
-    }
-
-    state->runtime_exact =
-        memcmp(state->runtime, ctx->images.runtime, PPR_RUNTIME_SIZE) == 0;
-    state->plaintext_exact =
-        memcmp(state->plaintext, ctx->images.plaintext,
-               PPR_PLAINTEXT_SIZE) == 0;
+static void ppr_classify_entry_state(const struct ppr_context *ctx,
+                                     struct ppr_state *state) {
     state->sites_known = 1;
     state->sites_stock = 1;
     state->sites_hooked = 1;
@@ -625,41 +497,158 @@ static int ppr_read_state(const struct ppr_context *ctx,
         state->sites_hooked &= hooked;
     }
 
+    state->legacy_sites_known = 1;
+    state->legacy_sites_stock = 1;
+    state->legacy_hook_present = 0;
+    for (size_t i = 0; i < PPR_LEGACY_SITE_COUNT; i++) {
+        int stock = state->legacy_site[i] ==
+                    ppr_legacy_stock_site(ctx->profile, i);
+        int hooked = state->legacy_site[i] == ctx->images.legacy_hook[i];
+        state->legacy_sites_known &= stock || hooked;
+        state->legacy_sites_stock &= stock;
+        state->legacy_hook_present |= hooked;
+    }
+    state->legacy_reboot_required = state->legacy_sites_known &&
+                                    state->legacy_hook_present;
+}
+
+static void ppr_classify_patch_state(struct ppr_state *state) {
     /* Cave padding is deliberately irrelevant while every entry is stock. */
-    state->native = state->sites_stock;
+    state->native = state->sites_stock && state->legacy_sites_stock;
     state->dynamic = state->runtime_exact && state->plaintext_exact &&
-                     state->sites_hooked;
+                     state->sites_hooked && state->legacy_sites_stock;
     state->recoverable = !state->native && !state->dynamic &&
                          state->runtime_exact && state->plaintext_exact &&
-                         state->sites_known;
-    ppr_classify_kmb_state(ctx, state);
+                         state->sites_known && state->legacy_sites_stock;
+}
+
+static void ppr_classify_caves(const struct ppr_context *ctx,
+                               struct ppr_state *state) {
+    state->runtime_exact =
+        memcmp(state->runtime, ctx->images.runtime, PPR_RUNTIME_SIZE) == 0;
+    state->plaintext_exact =
+        memcmp(state->plaintext, ctx->images.plaintext,
+               PPR_PLAINTEXT_SIZE) == 0;
+}
+
+static int ppr_read_state(const struct ppr_context *ctx,
+                          const struct ppr_resolved *resolved,
+                          struct ppr_state *state) {
+    memset(state, 0, sizeof(*state));
+
+    if (ctx->transport->fast_mode && ctx->transport->batch_enabled &&
+        ctx->transport->read_many) {
+        uint64_t addresses[2 + PPR_SITE_COUNT];
+        uint32_t sizes[2 + PPR_SITE_COUNT];
+        void *destinations[2 + PPR_SITE_COUNT];
+        size_t n = 0;
+#define STATE_READ(address, size, destination) do { \
+        addresses[n] = (address);                  \
+        sizes[n] = (size);                         \
+        destinations[n] = (destination);           \
+        n++;                                        \
+    } while (0)
+        STATE_READ(resolved->runtime_cave, PPR_RUNTIME_SIZE, state->runtime);
+        STATE_READ(resolved->plaintext_cave, PPR_PLAINTEXT_SIZE,
+                   state->plaintext);
+        for (size_t i = 0; i < PPR_SITE_COUNT; i++)
+            STATE_READ(resolved->site[i], 4, &state->site[i]);
+#undef STATE_READ
+        if (ctx->transport->read_many(ctx->transport->context, addresses,
+                                      sizes, destinations, (uint32_t)n) != 0)
+            return -1;
+    } else {
+        if (ppr_read(ctx, resolved->runtime_cave, state->runtime,
+                     sizeof(state->runtime)) != 0 ||
+            ppr_read(ctx, resolved->plaintext_cave, state->plaintext,
+                     sizeof(state->plaintext)) != 0)
+            return -1;
+        for (size_t i = 0; i < PPR_SITE_COUNT; i++) {
+            if (ppr_read(ctx, resolved->site[i], &state->site[i], 4) != 0)
+                return -1;
+        }
+    }
+
+    /* Keep the two retired guards outside the 15-command status batch. */
+    for (size_t i = 0; i < PPR_LEGACY_SITE_COUNT; i++) {
+        if (ppr_read(ctx, resolved->legacy_site[i],
+                     &state->legacy_site[i], 4) != 0)
+            return -1;
+    }
+
+    ppr_classify_caves(ctx, state);
+    ppr_classify_entry_state(ctx, state);
+    ppr_classify_patch_state(state);
     return 0;
 }
 
-static int ppr_kmb_state_known(const struct ppr_state *state) {
-    return state->fswrite_kmb_range_known;
-}
+static int ppr_read_action_state(const struct ppr_context *ctx,
+                                 const struct ppr_resolved *resolved,
+                                 struct ppr_state *state) {
+    memset(state, 0, sizeof(*state));
 
-static int ppr_kmb_state_stock(const struct ppr_state *state) {
-    return state->fswrite_kmb_range_stock;
-}
-
-static int ppr_kmb_state_patched(const struct ppr_state *state) {
-    return state->fswrite_kmb_range_patched;
-}
-
-static void ppr_print_kmb_state(const struct ppr_context *ctx,
-                                const struct ppr_state *state) {
-    if (!ppr_kmb_supported(ctx))
-        return;
-    if (ppr_kmb_state_patched(state)) {
-        ppr_logf(ctx, "[+] FsWrite opcode 0x53 KMB range guard: BYPASSED");
-    } else if (ppr_kmb_state_stock(state)) {
-        ppr_logf(ctx, "[*] FsWrite opcode 0x53 KMB range guard: STOCK");
+    /* One 15-command preflight covers every mutable and retired entry word. */
+    if (ctx->transport->fast_mode && ctx->transport->batch_enabled &&
+        ctx->transport->read_many) {
+        uint64_t addresses[PPR_SITE_COUNT + PPR_LEGACY_SITE_COUNT];
+        uint32_t sizes[PPR_SITE_COUNT + PPR_LEGACY_SITE_COUNT];
+        void *destinations[PPR_SITE_COUNT + PPR_LEGACY_SITE_COUNT];
+        size_t n = 0;
+        for (size_t i = 0; i < PPR_SITE_COUNT; i++) {
+            addresses[n] = resolved->site[i];
+            sizes[n] = 4;
+            destinations[n++] = &state->site[i];
+        }
+        for (size_t i = 0; i < PPR_LEGACY_SITE_COUNT; i++) {
+            addresses[n] = resolved->legacy_site[i];
+            sizes[n] = 4;
+            destinations[n++] = &state->legacy_site[i];
+        }
+        if (ctx->transport->read_many(ctx->transport->context, addresses,
+                                      sizes, destinations, (uint32_t)n) != 0)
+            return -1;
     } else {
-        ppr_logf(ctx, "[!] FsWrite opcode 0x53 KMB range guard: UNKNOWN (%08x)",
-                 state->fswrite_kmb_range);
+        for (size_t i = 0; i < PPR_SITE_COUNT; i++) {
+            if (ppr_read(ctx, resolved->site[i], &state->site[i], 4) != 0)
+                return -1;
+        }
+        for (size_t i = 0; i < PPR_LEGACY_SITE_COUNT; i++) {
+            if (ppr_read(ctx, resolved->legacy_site[i],
+                         &state->legacy_site[i], 4) != 0)
+                return -1;
+        }
     }
+
+    ppr_classify_entry_state(ctx, state);
+    ppr_classify_patch_state(state);
+    if (state->native || !state->sites_known ||
+        !state->legacy_sites_stock)
+        return 0;
+
+    /* Only an exact current hook/mix needs cave bytes for classification. */
+    if (ctx->transport->fast_mode && ctx->transport->batch_enabled &&
+        ctx->transport->read_many) {
+        const uint64_t addresses[2] = {
+            resolved->runtime_cave, resolved->plaintext_cave,
+        };
+        const uint32_t sizes[2] = {
+            PPR_RUNTIME_SIZE, PPR_PLAINTEXT_SIZE,
+        };
+        void *const destinations[2] = {
+            state->runtime, state->plaintext,
+        };
+        if (ctx->transport->read_many(ctx->transport->context, addresses,
+                                      sizes, destinations, 2) != 0)
+            return -1;
+    } else if (ppr_read(ctx, resolved->runtime_cave, state->runtime,
+                        sizeof(state->runtime)) != 0 ||
+               ppr_read(ctx, resolved->plaintext_cave, state->plaintext,
+                        sizeof(state->plaintext)) != 0) {
+        return -1;
+    }
+    ppr_classify_caves(ctx, state);
+    ppr_classify_patch_state(state);
+    return 0;
 }
 
 static void ppr_print_state(const struct ppr_context *ctx,
@@ -667,35 +656,141 @@ static void ppr_print_state(const struct ppr_context *ctx,
     if (state->native) {
         ppr_logf(ctx, "[+] PPR patch state: STOCK/NATIVE (unused tail ignored)");
     } else if (state->dynamic) {
-        ppr_logf(ctx, "[+] PPR patch state: DYNAMIC_INSTALLED (10 callers; AES ff => PLAINTEXT_NOAUTH)");
+        ppr_logf(ctx, "[+] PPR patch state: DYNAMIC_INSTALLED (10 callers + 3 internal hooks; FE/FF => ordered PLAINTEXT_NOAUTH)");
+    } else if (state->legacy_reboot_required) {
+        ppr_logf(ctx, "[!] PPR patch state: LEGACY_REBOOT_REQUIRED (retired hooks remain connected)");
     } else if (state->recoverable) {
-        ppr_logf(ctx, "[!] PPR patch state: INTERRUPTED BUT EXACTLY RECOVERABLE");
+        ppr_logf(ctx, "[!] PPR patch state: INTERRUPTED CURRENT IMAGE BUT EXACTLY RECOVERABLE");
     } else {
         ppr_logf(ctx, "[!] PPR patch state: UNKNOWN OR PARTIALLY PATCHED");
         ppr_logf(ctx, "    runtime=%s plaintext=%s sites=%s",
                  state->runtime_exact ? "PATCH" : "UNKNOWN",
                  state->plaintext_exact ? "PATCH" : "UNKNOWN",
                  state->sites_known ? "KNOWN-MIX" : "UNKNOWN");
-        ppr_logf(ctx, "    call1=%08x call2=%08x precheck=%08x dispatch=%08x",
+        ppr_logf(ctx, "    call1=%08x call2=%08x aes0=%08x aes1=%08x sha=%08x",
                  state->site[0], state->site[1],
                  state->site[PPR_CALL_COUNT],
-                 state->site[PPR_CALL_COUNT + 1U]);
+                 state->site[PPR_CALL_COUNT + 1U],
+                 state->site[PPR_CALL_COUNT + PPR_AES_SITE_COUNT]);
     }
-    ppr_print_kmb_state(ctx, state);
+    if (!state->legacy_sites_stock) {
+        ppr_logf(ctx, "    legacy-precheck=%08x legacy-dispatch=%08x (%s)",
+                 state->legacy_site[0], state->legacy_site[1],
+                 state->legacy_sites_known ? "EXACT OLD/STOCK MIX" : "UNKNOWN");
+    }
 }
 
 static int ppr_write_checked(const struct ppr_context *ctx, uint64_t pa,
                              const void *bytes, uint32_t size,
                              const char *name) {
     uint8_t verify[PPR_PLAINTEXT_SIZE];
-    if (size > sizeof(verify) || ppr_write(ctx, pa, bytes, size) != 0 ||
-        ppr_read(ctx, pa, verify, size) != 0 ||
-        memcmp(verify, bytes, size) != 0) {
+    if (size > sizeof(verify))
+        return -1;
+
+    int write_result = ppr_write(ctx, pa, bytes, size);
+    int read_result = ppr_read(ctx, pa, verify, size);
+    if (read_result == 0 && memcmp(verify, bytes, size) == 0) {
+        if (write_result != 0)
+            ppr_logf(ctx,
+                     "[*] reconciled an unconfirmed write for %s @ PA 0x%lx",
+                     name, (unsigned long)pa);
+        return 0;
+    }
+    {
         ppr_logf(ctx, "[!] write/readback failed for %s @ PA 0x%lx",
                  name, (unsigned long)pa);
         return -1;
     }
+}
+
+static int ppr_write_many_available(const struct ppr_context *ctx) {
+    return ctx->transport->fast_mode && ctx->transport->batch_enabled &&
+           ctx->transport->mixed_io_enabled &&
+           ctx->transport->write_many_read_many;
+}
+
+static int ppr_verify_expected_many(
+        const struct ppr_context *ctx, const uint64_t *addresses,
+        const void *const *expected, const uint32_t *sizes,
+        const char *const *names, uint32_t count) {
+    uint8_t verify[PPR_CALL_COUNT][PPR_PLAINTEXT_SIZE];
+    void *destinations[PPR_CALL_COUNT];
+
+    if (!addresses || !expected || !sizes || !names || count == 0 ||
+        count > PPR_CALL_COUNT)
+        return -1;
+    for (uint32_t i = 0; i < count; i++) {
+        if (!expected[i] || !names[i] || sizes[i] == 0 ||
+            sizes[i] > sizeof(verify[i]))
+            return -1;
+        destinations[i] = verify[i];
+    }
+
+    if (ctx->transport->fast_mode && ctx->transport->batch_enabled &&
+        ctx->transport->read_many) {
+        if (ctx->transport->read_many(
+                ctx->transport->context, addresses, sizes, destinations,
+                count) != 0)
+            return -1;
+    } else {
+        for (uint32_t i = 0; i < count; i++) {
+            if (ppr_read(ctx, addresses[i], destinations[i], sizes[i]) != 0)
+                return -1;
+        }
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        if (memcmp(verify[i], expected[i], sizes[i]) != 0) {
+            ppr_logf(ctx, "[!] exact verification mismatch for %s @ PA 0x%lx",
+                     names[i], (unsigned long)addresses[i]);
+            return -1;
+        }
+    }
     return 0;
+}
+
+static int ppr_write_many_checked(
+        const struct ppr_context *ctx, const uint64_t *addresses,
+        const void *const *sources, const uint32_t *sizes,
+        const char *const *names, uint32_t count) {
+    uint8_t verify[PPR_MIXED_WRITE_MAX][PPR_PLAINTEXT_SIZE];
+    void *destinations[PPR_MIXED_WRITE_MAX];
+
+    if (!ppr_write_many_available(ctx) || !addresses || !sources || !sizes ||
+        !names || count == 0 || count > PPR_MIXED_WRITE_MAX)
+        return -1;
+    for (uint32_t i = 0; i < count; i++) {
+        if (!sources[i] || !names[i] || sizes[i] == 0 ||
+            sizes[i] > sizeof(verify[i]))
+            return -1;
+        destinations[i] = verify[i];
+    }
+    int transport_result = ctx->transport->write_many_read_many(
+            ctx->transport->context, addresses, sources, sizes,
+            destinations, count);
+    if (transport_result == 0) {
+        uint32_t i = 0;
+        for (; i < count; i++) {
+            if (memcmp(verify[i], sources[i], sizes[i]) != 0)
+                break;
+        }
+        if (i == count)
+            return 0;
+    }
+
+    /* A timeout means "completion unknown", not "the write did not run".
+     * Reopen the transport and reconcile the intended bytes before deciding
+     * whether this phase needs rollback. */
+    if (ppr_verify_expected_many(ctx, addresses, sources, sizes, names,
+                                 count) == 0) {
+        ppr_logf(ctx,
+                 "[*] reconciled an unconfirmed grouped write for %u items (%s .. %s)",
+                 count, names[0], names[count - 1U]);
+        return 0;
+    }
+    ppr_logf(ctx,
+             "[!] grouped write/readback failed for %u items (%s .. %s)",
+             count, names[0], names[count - 1U]);
+    return -1;
 }
 
 static int ppr_write_pair_checked(const struct ppr_context *ctx,
@@ -703,6 +798,14 @@ static int ppr_write_pair_checked(const struct ppr_context *ctx,
                                   uint32_t size0, const char *name0,
                                   uint64_t pa1, const void *bytes1,
                                   uint32_t size1, const char *name1) {
+    if (ppr_write_many_available(ctx)) {
+        const uint64_t addresses[2] = {pa0, pa1};
+        const void *sources[2] = {bytes0, bytes1};
+        const uint32_t sizes[2] = {size0, size1};
+        const char *names[2] = {name0, name1};
+        return ppr_write_many_checked(ctx, addresses, sources, sizes, names,
+                                      2);
+    }
     if (!ctx->transport->fast_mode || !ctx->transport->batch_enabled ||
         !ctx->transport->mixed_io_enabled ||
         !ctx->transport->write_pair_read_pair) {
@@ -713,24 +816,62 @@ static int ppr_write_pair_checked(const struct ppr_context *ctx,
 
     uint8_t verify0[PPR_PLAINTEXT_SIZE];
     uint8_t verify1[PPR_PLAINTEXT_SIZE];
-    if (size0 > sizeof(verify0) || size1 > sizeof(verify1) ||
-        ctx->transport->write_pair_read_pair(
+    if (size0 > sizeof(verify0) || size1 > sizeof(verify1))
+        return -1;
+    int transport_result = ctx->transport->write_pair_read_pair(
             ctx->transport->context,
             pa0, bytes0, size0, verify0,
-            pa1, bytes1, size1, verify1) != 0 ||
-        memcmp(verify0, bytes0, size0) != 0 ||
-        memcmp(verify1, bytes1, size1) != 0) {
-        ppr_logf(ctx, "[!] paired write/readback failed for %s / %s @ PA 0x%lx / 0x%lx",
-                 name0, name1, (unsigned long)pa0, (unsigned long)pa1);
-        return -1;
+            pa1, bytes1, size1, verify1);
+    if (transport_result == 0 &&
+        memcmp(verify0, bytes0, size0) == 0 &&
+        memcmp(verify1, bytes1, size1) == 0)
+        return 0;
+
+    const uint64_t addresses[2] = {pa0, pa1};
+    const void *expected[2] = {bytes0, bytes1};
+    const uint32_t sizes[2] = {size0, size1};
+    const char *names[2] = {name0, name1};
+    if (ppr_verify_expected_many(ctx, addresses, expected, sizes, names, 2) == 0) {
+        ppr_logf(ctx, "[*] reconciled an unconfirmed paired write for %s / %s",
+                 name0, name1);
+        return 0;
     }
-    return 0;
+    ppr_logf(ctx, "[!] paired write/readback failed for %s / %s @ PA 0x%lx / 0x%lx",
+             name0, name1, (unsigned long)pa0, (unsigned long)pa1);
+    return -1;
 }
 
 static int ppr_write_sites(const struct ppr_context *ctx,
                            const struct ppr_resolved *resolved,
                            size_t first, size_t end, int install) {
     size_t i = first;
+    if (ppr_write_many_available(ctx)) {
+        while (i < end) {
+            uint64_t addresses[PPR_MIXED_WRITE_MAX];
+            uint32_t values[PPR_MIXED_WRITE_MAX];
+            const void *sources[PPR_MIXED_WRITE_MAX];
+            uint32_t sizes[PPR_MIXED_WRITE_MAX];
+            const char *names[PPR_MIXED_WRITE_MAX];
+            size_t remaining = end - i;
+            uint32_t count = remaining > PPR_MIXED_WRITE_MAX
+                ? PPR_MIXED_WRITE_MAX : (uint32_t)remaining;
+
+            for (uint32_t j = 0; j < count; j++) {
+                size_t site = i + j;
+                addresses[j] = resolved->site[site];
+                values[j] = install ? ctx->images.site_hook[site]
+                                    : ppr_stock_site(ctx->profile, site);
+                sources[j] = &values[j];
+                sizes[j] = sizeof(values[j]);
+                names[j] = ppr_site_name(site);
+            }
+            if (ppr_write_many_checked(ctx, addresses, sources, sizes, names,
+                                       count) != 0)
+                return -1;
+            i += count;
+        }
+        return 0;
+    }
     for (; ctx->transport->fast_mode && ctx->transport->batch_enabled &&
            ctx->transport->mixed_io_enabled &&
            ctx->transport->write_pair_read_pair && i + 1 < end; i += 2) {
@@ -738,12 +879,8 @@ static int ppr_write_sites(const struct ppr_context *ctx,
                                   : ppr_stock_site(ctx->profile, i);
         uint32_t value1 = install ? ctx->images.site_hook[i + 1]
                                   : ppr_stock_site(ctx->profile, i + 1);
-        const char *name0 = i < PPR_CALL_COUNT ? ppr_call_names[i]
-                                               : (i == PPR_CALL_COUNT
-                                                  ? "precheck" : "dispatch");
-        const char *name1 = i + 1 < PPR_CALL_COUNT ? ppr_call_names[i + 1]
-                                                   : (i + 1 == PPR_CALL_COUNT
-                                                      ? "precheck" : "dispatch");
+        const char *name0 = ppr_site_name(i);
+        const char *name1 = ppr_site_name(i + 1);
         if (ppr_write_pair_checked(ctx,
                 resolved->site[i], &value0, 4, name0,
                 resolved->site[i + 1], &value1, 4, name1) != 0)
@@ -752,22 +889,81 @@ static int ppr_write_sites(const struct ppr_context *ctx,
     for (; i < end; i++) {
         uint32_t value = install ? ctx->images.site_hook[i]
                                  : ppr_stock_site(ctx->profile, i);
-        const char *name = i < PPR_CALL_COUNT ? ppr_call_names[i]
-                                              : (i == PPR_CALL_COUNT
-                                                 ? "precheck" : "dispatch");
+        const char *name = ppr_site_name(i);
         if (ppr_write_checked(ctx, resolved->site[i], &value, 4, name) != 0)
             return -1;
     }
     return 0;
 }
 
-static void ppr_restore_stock_best_effort(const struct ppr_context *ctx,
-                                          const struct ppr_resolved *resolved) {
-    /* Disconnect all entry points; dormant cave bytes are harmless. */
-    for (size_t i = 0; i < PPR_SITE_COUNT; i++) {
-        uint32_t stock = ppr_stock_site(ctx->profile, i);
-        (void)ppr_write(ctx, resolved->site[i], &stock, 4);
+static int ppr_restore_stock_checked(const struct ppr_context *ctx,
+                                     const struct ppr_resolved *resolved) {
+    /* Retired legacy sites are read-only guards and are never mutated here. */
+    if (ppr_write_sites(ctx, resolved, 0, PPR_CALL_COUNT, 0) != 0 ||
+        ppr_write_sites(ctx, resolved, PPR_CALL_COUNT,
+                        PPR_SITE_COUNT, 0) != 0)
+        return -1;
+    return 0;
+}
+
+static int ppr_restore_site_range_best_effort(
+        const struct ppr_context *ctx, const struct ppr_resolved *resolved,
+        size_t first, size_t end) {
+    uint64_t addresses[PPR_CALL_COUNT];
+    uint32_t values[PPR_CALL_COUNT];
+    const void *expected[PPR_CALL_COUNT];
+    uint32_t sizes[PPR_CALL_COUNT];
+    const char *names[PPR_CALL_COUNT];
+    size_t count = end - first;
+    if (end < first || count == 0 || count > PPR_CALL_COUNT)
+        return -1;
+
+    for (size_t i = 0; i < count; i++) {
+        size_t site = first + i;
+        addresses[i] = resolved->site[site];
+        values[i] = ppr_stock_site(ctx->profile, site);
+        expected[i] = &values[i];
+        sizes[i] = sizeof(values[i]);
+        names[i] = ppr_site_name(site);
     }
+    for (size_t i = first; i < end; i++) {
+        uint32_t stock = ppr_stock_site(ctx->profile, i);
+        if (ppr_write(ctx, resolved->site[i], &stock, 4) != 0) {
+            uint32_t observed = 0;
+            if (ppr_read(ctx, resolved->site[i], &observed,
+                         sizeof(observed)) != 0 || observed != stock) {
+                ppr_logf(ctx,
+                         "[!] rollback write remains unconfirmed for %s @ PA 0x%lx",
+                         ppr_site_name(i),
+                         (unsigned long)resolved->site[i]);
+                break;
+            }
+            ppr_logf(ctx,
+                     "[*] reconciled an unconfirmed rollback write for %s",
+                     ppr_site_name(i));
+        }
+    }
+    return ppr_verify_expected_many(
+        ctx, addresses, expected, sizes, names, (uint32_t)count);
+}
+
+static int ppr_restore_stock_best_effort(const struct ppr_context *ctx,
+                                         const struct ppr_resolved *resolved) {
+    /* Do not restore internal helpers while any public caller may still
+     * branch through them. Retired legacy sites remain read-only guards. */
+    if (ppr_restore_site_range_best_effort(
+            ctx, resolved, 0, PPR_CALL_COUNT) != 0) {
+        ppr_logf(ctx,
+                 "[!] ROLLBACK_REBOOT_REQUIRED: public hook restore is unconfirmed; internal hooks were left intact");
+        return -1;
+    }
+    if (ppr_restore_site_range_best_effort(
+            ctx, resolved, PPR_CALL_COUNT, PPR_SITE_COUNT) != 0) {
+        ppr_logf(ctx,
+                 "[!] ROLLBACK_REBOOT_REQUIRED: internal hook restore is unconfirmed");
+        return -1;
+    }
+    return 0;
 }
 
 static void ppr_print_stats(const struct ppr_context *ctx) {
@@ -784,50 +980,24 @@ static void ppr_print_stats(const struct ppr_context *ctx) {
              (unsigned long)ticks);
 }
 
-static int ppr_change_kmb_state(const struct ppr_context *ctx,
-                                const struct ppr_resolved *resolved,
-                                enum ppr_patch_action action) {
-    struct ppr_state before, after;
-    int install = action == PPR_PATCH_KMB_RANGE_INSTALL;
-    if (!ppr_kmb_supported(ctx)) {
-        ppr_logf(ctx, "[!] FsWrite KMB range patch is unavailable for MP4 %s",
-                 ctx->profile->name);
-        return -1;
-    }
-    if (ppr_read_kmb_state(ctx, resolved, &before) != 0)
-        return -1;
-    ppr_print_kmb_state(ctx, &before);
-    if (!ppr_kmb_state_known(&before)) {
-        ppr_logf(ctx, "[!] FsWrite KMB change refused: instruction must be an exact stock or patched value");
-        return -1;
-    }
-    if ((install && ppr_kmb_state_patched(&before)) ||
-        (!install && ppr_kmb_state_stock(&before))) {
-        ppr_logf(ctx, "[+] FsWrite opcode 0x53 KMB range guard is already %s",
-                 install ? "bypassed" : "stock");
-        ppr_print_stats(ctx);
-        return 0;
-    }
-
-    uint32_t desired = install ? ctx->profile->fswrite_kmb_range_patch
-                               : ctx->profile->fswrite_kmb_range_stock;
-    if (ppr_write_checked(ctx, resolved->fswrite_kmb_range, &desired, 4,
-                          "FsWrite encrypt KMB range instruction") != 0 ||
-        ppr_read_kmb_state(ctx, resolved, &after) != 0) {
-        ppr_logf(ctx, "[!] FsWrite KMB update failed");
-        return -1;
-    }
-    ppr_print_kmb_state(ctx, &after);
-    ppr_print_stats(ctx);
-    return install ? (ppr_kmb_state_patched(&after) ? 0 : -1)
-                   : (ppr_kmb_state_stock(&after) ? 0 : -1);
-}
-
 int ppr_patch_run(const struct ppr_patch_transport *transport,
                   uint32_t firmware, enum ppr_patch_action action,
                   int idle_acknowledged) {
     if (!transport || !transport->read || !transport->write)
         return -1;
+    switch (action) {
+    case PPR_PATCH_STATUS:
+    case PPR_PATCH_INSTALL:
+    case PPR_PATCH_UNINSTALL:
+    case PPR_PATCH_MODE_NATIVE:
+    case PPR_PATCH_MODE_PLAINTEXT_NOAUTH:
+        break;
+    default:
+        if (transport->log)
+            transport->log(transport->context,
+                           "[!] invalid PPR patch action");
+        return -1;
+    }
     const struct ppr_profile *profile = ppr_find_profile(firmware);
     if (!profile) {
         if (transport->log) {
@@ -852,20 +1022,14 @@ int ppr_patch_run(const struct ppr_patch_transport *transport,
         ppr_logf(&ctx, "[!] refusing A53 mutation: halt/drain PackageRead and APR rings, then pass --i-know-ppr-idle");
         return -1;
     }
-    if (transport->fast_mode)
-        ppr_logf(&ctx, "[+] PPR mode: FAST (layout/state batching=%s, paired write/readback=%s)",
-                 transport->batch_enabled && transport->read_many ? "on" : "off",
-                 transport->batch_enabled && transport->mixed_io_enabled &&
-                 transport->write_pair_read_pair ? "on" : "off");
-
     struct ppr_resolved resolved = {0};
-    struct ppr_state before, after;
+    struct ppr_state before;
     if (ppr_resolve(&ctx, &resolved) != 0)
         return -1;
-    if (action == PPR_PATCH_KMB_RANGE_INSTALL ||
-        action == PPR_PATCH_KMB_RANGE_UNINSTALL)
-        return ppr_change_kmb_state(&ctx, &resolved, action);
-    if (ppr_read_state(&ctx, &resolved, &before) != 0)
+    int state_result = action == PPR_PATCH_STATUS
+        ? ppr_read_state(&ctx, &resolved, &before)
+        : ppr_read_action_state(&ctx, &resolved, &before);
+    if (state_result != 0)
         return -1;
     ppr_print_state(&ctx, &before);
 
@@ -876,14 +1040,8 @@ int ppr_patch_run(const struct ppr_patch_transport *transport,
         ppr_logf(&ctx, "[*] plaintext cave VA=0x%lx PA=0x%lx",
                  (unsigned long)profile->plaintext_cave_va,
                  (unsigned long)resolved.plaintext_cave);
-        if (ppr_kmb_supported(&ctx))
-            ppr_logf(&ctx, "[*] FsWrite KMB range guard VA=0x%lx PA=0x%lx",
-                     (unsigned long)profile->fswrite_kmb_range_va,
-                     (unsigned long)resolved.fswrite_kmb_range);
         ppr_print_stats(&ctx);
-        return (before.native || before.dynamic) &&
-               (ppr_kmb_state_stock(&before) ||
-                ppr_kmb_state_patched(&before)) ? 0 : -1;
+        return before.native || before.dynamic ? 0 : -1;
     }
 
     int install = action == PPR_PATCH_INSTALL ||
@@ -899,26 +1057,37 @@ int ppr_patch_run(const struct ppr_patch_transport *transport,
             return -1;
         }
         if (before.recoverable) {
-            ppr_logf(&ctx, "[*] restoring exact stock entry points before retry");
-            ppr_restore_stock_best_effort(&ctx, &resolved);
-            if (ppr_read_state(&ctx, &resolved, &before) != 0 ||
-                !before.native) {
-                ppr_logf(&ctx, "[!] exact stock recovery failed");
+            ppr_logf(&ctx, "[*] restoring exact current entry points before retry");
+            if (ppr_restore_stock_checked(&ctx, &resolved) != 0) {
+                ppr_logf(&ctx, "[!] exact stock recovery write failed; applying ordered best-effort rollback");
+                (void)ppr_restore_stock_best_effort(&ctx, &resolved);
                 return -1;
             }
         }
 
-        /* Build dormant code first, then connect control-flow sites. */
+        /* Build dormant code first, then connect control-flow sites.  Roll
+         * back only phases which may already be visible; a failed cave write
+         * cannot require thirteen unnecessary entry-site transactions. */
         if (ppr_write_pair_checked(
                 &ctx, resolved.plaintext_cave, ctx.images.plaintext,
                 PPR_PLAINTEXT_SIZE, "plaintext executable-tail cave",
                 resolved.runtime_cave, ctx.images.runtime,
-                PPR_RUNTIME_SIZE, "runtime executable-tail cave") != 0 ||
-            ppr_write_sites(&ctx, &resolved, PPR_CALL_COUNT,
-                            PPR_SITE_COUNT, 1) != 0 ||
-            ppr_write_sites(&ctx, &resolved, 0, PPR_CALL_COUNT, 1) != 0) {
-            ppr_logf(&ctx, "[!] dynamic install failed; attempting stock rollback");
-            ppr_restore_stock_best_effort(&ctx, &resolved);
+                PPR_RUNTIME_SIZE, "runtime executable-tail cave") != 0) {
+            ppr_logf(&ctx, "[!] dormant cave install failed; no entry hooks were connected");
+            return -1;
+        }
+        if (ppr_write_sites(&ctx, &resolved, PPR_CALL_COUNT,
+                            PPR_SITE_COUNT, 1) != 0) {
+            ppr_logf(&ctx, "[!] internal-hook install failed; restoring only internal sites");
+            if (ppr_restore_site_range_best_effort(
+                    &ctx, &resolved, PPR_CALL_COUNT, PPR_SITE_COUNT) != 0)
+                ppr_logf(&ctx,
+                         "[!] ROLLBACK_REBOOT_REQUIRED: internal install rollback is unconfirmed");
+            return -1;
+        }
+        if (ppr_write_sites(&ctx, &resolved, 0, PPR_CALL_COUNT, 1) != 0) {
+            ppr_logf(&ctx, "[!] public-hook install failed; attempting ordered stock rollback");
+            (void)ppr_restore_stock_best_effort(&ctx, &resolved);
             return -1;
         }
     } else {
@@ -931,22 +1100,19 @@ int ppr_patch_run(const struct ppr_patch_transport *transport,
             return -1;
         }
         if (before.recoverable)
-            ppr_logf(&ctx, "[*] rolling back an interrupted exact-image transaction");
+            ppr_logf(&ctx, "[*] rolling back a recognized interrupted current image");
 
-        /* Disconnect public callers before the two internal entry points. */
-        if (ppr_write_sites(&ctx, &resolved, 0, PPR_CALL_COUNT, 0) != 0 ||
-            ppr_write_sites(&ctx, &resolved, PPR_CALL_COUNT,
-                            PPR_SITE_COUNT, 0) != 0) {
+        /* Disconnect public callers before current internal hooks. */
+        if (ppr_restore_stock_checked(&ctx, &resolved) != 0) {
             ppr_logf(&ctx, "[!] stock restore failed; leaving best-effort stock entry points");
-            ppr_restore_stock_best_effort(&ctx, &resolved);
+            (void)ppr_restore_stock_best_effort(&ctx, &resolved);
             return -1;
         }
     }
 
-    if (ppr_read_state(&ctx, &resolved, &after) != 0)
-        return -1;
-    ppr_print_state(&ctx, &after);
+    ppr_logf(&ctx, install
+             ? "[+] dynamic Native/PLAINTEXT_NOAUTH patch installed and read back"
+             : "[+] current PPR entry points restored to stock and read back");
     ppr_print_stats(&ctx);
-    return install ? (after.dynamic ? 0 : -1)
-                   : (after.native ? 0 : -1);
+    return 0;
 }

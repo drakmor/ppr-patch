@@ -50,10 +50,6 @@ static void usage(const char *program) {
     puts("  --mode native --idle      select native mode");
     puts("  --mode plaintext-noauth --idle");
     puts("                            select FE/FF plaintext mode");
-    puts("  --kmb-range-install --idle");
-    puts("                            bypass the opcode-0x53 AES range guard");
-    puts("  --kmb-range-uninstall --idle");
-    puts("                            restore the opcode-0x53 range guard");
     puts("transport options (read-only verified before use):");
     puts("  --fast --persistent --batch --mixed-io");
     puts("  --conservative            disable all fast transports");
@@ -74,6 +70,7 @@ int main(int argc, char **argv) {
         .mixed_io = PPR_DEFAULT_MIXED_IO,
     };
     int selected = 0;
+    int transport_selected = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--status") == 0 ||
@@ -88,12 +85,6 @@ int main(int argc, char **argv) {
                    strcmp(argv[i], "--ppr-uninstall") == 0) {
             if (selected++) goto conflict;
             action = PPR_PATCH_UNINSTALL;
-        } else if (strcmp(argv[i], "--kmb-range-install") == 0) {
-            if (selected++) goto conflict;
-            action = PPR_PATCH_KMB_RANGE_INSTALL;
-        } else if (strcmp(argv[i], "--kmb-range-uninstall") == 0) {
-            if (selected++) goto conflict;
-            action = PPR_PATCH_KMB_RANGE_UNINSTALL;
         } else if ((strcmp(argv[i], "--mode") == 0 ||
                     strcmp(argv[i], "--ppr-mode") == 0) && i + 1 < argc) {
             if (selected++) goto conflict;
@@ -110,14 +101,19 @@ int main(int argc, char **argv) {
                    strcmp(argv[i], "--i-know-ppr-idle") == 0) {
             idle_acknowledged = 1;
         } else if (strcmp(argv[i], "--fast") == 0) {
+            transport_selected = 1;
             fast_mode = 1;
         } else if (strcmp(argv[i], "--persistent") == 0) {
+            transport_selected = 1;
             options.persistent = 1;
         } else if (strcmp(argv[i], "--batch") == 0) {
+            transport_selected = 1;
             options.batch = 1;
         } else if (strcmp(argv[i], "--mixed-io") == 0) {
+            transport_selected = 1;
             options.mixed_io = 1;
         } else if (strcmp(argv[i], "--conservative") == 0) {
+            transport_selected = 1;
             fast_mode = 0;
             options.persistent = 0;
             options.batch = 0;
@@ -131,6 +127,17 @@ int main(int argc, char **argv) {
             usage(argv[0]);
             return 2;
         }
+    }
+
+    /* Installation/restoration is fast by default even through the
+     * argument-driven payload. Status stays minimal, and an explicit
+     * transport selection (especially --conservative) is never overridden. */
+    if (action != PPR_PATCH_STATUS && !transport_selected && !fast_mode &&
+        !options.persistent && !options.batch && !options.mixed_io) {
+        fast_mode = 1;
+        options.persistent = 1;
+        options.batch = 1;
+        options.mixed_io = 1;
     }
 
     uint32_t system_firmware = kernel_get_fw_version() & 0xffff0000U;
@@ -176,8 +183,10 @@ int main(int argc, char **argv) {
 
     struct ppr_patch_transport transport;
     a53_transport_make_ppr(&transport, fast_mode);
-    return ppr_patch_run(&transport, target_firmware, action,
-                         idle_acknowledged) == 0 ? 0 : 1;
+    int result = ppr_patch_run(&transport, target_firmware, action,
+                               idle_acknowledged);
+    ppr_notify_flush();
+    return result == 0 ? 0 : 1;
 
 conflict:
     puts("[!] select exactly one action");

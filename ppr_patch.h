@@ -9,16 +9,16 @@ enum ppr_patch_action {
     PPR_PATCH_UNINSTALL,
     PPR_PATCH_MODE_NATIVE,
     PPR_PATCH_MODE_PLAINTEXT_NOAUTH,
-    PPR_PATCH_KMB_RANGE_INSTALL,
-    PPR_PATCH_KMB_RANGE_UNINSTALL,
 };
 
 /*
  * The PPR patcher deliberately knows nothing about the PS5 kernel API or the
- * DECI5S packet format.  A frontend supplies the four transport operations
- * below. Scalar read returns a positive transferred-byte count; scalar write,
- * read_many and write_pair_read_pair return zero on success. The latter two
- * callbacks are optional accelerators.
+ * DECI5S packet format.  A frontend supplies the transport operations
+ * below. Scalar read returns the exact transferred-byte count; scalar write,
+ * read_many, write_many_read_many and write_pair_read_pair return zero on
+ * success. The batched callbacks are optional accelerators. The current PPR
+ * state machine submits at most eight write/readback items (sixteen ordered
+ * SDBGP commands) per write_many_read_many call.
  */
 struct ppr_patch_transport {
     void *context;
@@ -29,6 +29,11 @@ struct ppr_patch_transport {
     int (*read_many)(void *context, const uint64_t *addresses,
                      const uint32_t *sizes, void *const *destinations,
                      uint32_t count);
+    int (*write_many_read_many)(void *context, const uint64_t *addresses,
+                                const void *const *sources,
+                                const uint32_t *sizes,
+                                void *const *destinations, uint32_t count);
+    /* Compatibility accelerator for frontends that only support two items. */
     int (*write_pair_read_pair)(void *context,
                                 uint64_t pa0, const void *src0,
                                 uint32_t size0, void *readback0,
