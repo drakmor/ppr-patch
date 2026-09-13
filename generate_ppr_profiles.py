@@ -15,7 +15,8 @@ EXPECTED_RELEASES = [
     (4, 2), (4, 3), (4, 50), (4, 51), (5, 0), (5, 2), (5, 10),
     (5, 50), (6, 0), (6, 2), (6, 50), (7, 0), (7, 1), (7, 20),
     (7, 40), (7, 60), (7, 61), (8, 0), (8, 20), (8, 40), (8, 60),
-    (9, 0), (9, 20), (9, 40), (9, 60), (10, 0), (10, 1), (10, 20),
+    (9, 0), (9, 5), (9, 20), (9, 40), (9, 60), (10, 0), (10, 1),
+    (10, 20),
     (10, 40), (10, 60), (11, 0), (11, 20), (11, 40),
 ]
 
@@ -26,6 +27,19 @@ SOURCE_ALIASES = {
     (6, 0, 1): (6, 0),
     (7, 1, 1): (7, 1),
     (8, 20, 2): (8, 20),
+}
+
+TARGET_ORDER = {
+    "PPR_TARGET_ANY": 0,
+    "PPR_TARGET_RETAIL": 1,
+    "PPR_TARGET_TESTKIT": 2,
+    "PPR_TARGET_DEVKIT": 3,
+}
+
+ARCHIVE_TARGETS = {
+    "retail": "PPR_TARGET_RETAIL",
+    "testkit": "PPR_TARGET_TESTKIT",
+    "devkit": "PPR_TARGET_DEVKIT",
 }
 
 ABI_SIGNATURES = {
@@ -492,16 +506,20 @@ class Elf64:
 
 def has_exact_release_marker(source, release):
     marker = f"releases/{release[0]:02d}.{release[1]:02d}".encode()
-    data = source.data if isinstance(source, Elf64) else Elf64(source).data
-    cursor = 0
-    while True:
-        cursor = data.find(marker, cursor)
-        if cursor < 0:
-            return False
-        end = cursor + len(marker)
-        if end == len(data) or data[end] not in b".0123456789":
-            return True
-        cursor += 1
+    elf = source if isinstance(source, Elf64) else Elf64(source)
+    for segment in elf.loads:
+        start = segment["offset"]
+        limit = start + segment["filesz"]
+        cursor = start
+        while True:
+            cursor = elf.data.find(marker, cursor, limit)
+            if cursor < 0:
+                break
+            end = cursor + len(marker)
+            if end == limit or elf.data[end] not in b".0123456789":
+                return True
+            cursor += 1
+    return False
 
 
 def source_matches_release(path, release):
@@ -512,7 +530,87 @@ def source_matches_release(path, release):
         return False
 
 
-def discover_source_inventory(full_root, dram_root):
+def target_from_elf(elf, release):
+    marker = f"releases/{release[0]:02d}.{release[1]:02d}".encode()
+    targets = set()
+    for segment in elf.loads:
+        segment_start = segment["offset"]
+        segment_end = segment_start + segment["filesz"]
+        cursor = segment_start
+        while True:
+            cursor = elf.data.find(marker, cursor, segment_end)
+            if cursor < 0:
+                break
+            marker_end = cursor + len(marker)
+            cursor += 1
+            if marker_end < segment_end and elf.data[marker_end] in \
+                    b".0123456789":
+                continue
+            start = elf.data.rfind(
+                b"\0", max(segment_start, cursor - 512), cursor - 1) + 1
+            end = elf.data.find(
+                b"\0", marker_end, min(segment_end, marker_end + 512))
+            if end < 0:
+                continue
+            value = elf.data[start:end].lower()
+            if b"oberon-kde" not in value:
+                continue
+            if b"devkit(" in value or b"build.rev devkit" in value:
+                targets.add("PPR_TARGET_DEVKIT")
+            elif b"testkit(" in value or b"build.rev testkit" in value:
+                targets.add("PPR_TARGET_TESTKIT")
+            elif b"cex(" in value or b"build.rev cex" in value:
+                targets.add("PPR_TARGET_RETAIL")
+            else:
+                targets.add("PPR_TARGET_ANY")
+    if len(targets) != 1:
+        fail(f"{elf.path}: expected one target classification for "
+             f"{release_name(release)}, found {sorted(targets)}")
+    return next(iter(targets))
+
+
+def discover_archive_images(root):
+    root = pathlib.Path(root)
+    if not root.is_dir():
+        fail(f"source root does not exist: {root}")
+    images = []
+    for directory, target in ARCHIVE_TARGETS.items():
+        target_root = root / directory
+        if not target_root.is_dir():
+            fail(f"missing target directory: {target_root}")
+        for version_dir in target_root.iterdir():
+            release = release_key(version_dir.name)
+            if release is None or not version_dir.is_dir():
+                continue
+            for name in ("a53.elf", "mp4_dram.elf"):
+                path = version_dir / name
+                if path.is_file():
+                    images.append((release, target, path))
+    return sorted(images, key=lambda item: (
+        item[0], TARGET_ORDER[item[1]], item[2].name))
+
+
+def discover_target_source_inventory(root):
+    inventory = {}
+    for source_release, archive_target, path in discover_archive_images(root):
+        release = SOURCE_ALIASES.get(source_release, source_release)
+        if release not in EXPECTED_RELEASES:
+            continue
+        elf = Elf64(path)
+        if not has_exact_release_marker(elf, release):
+            fail(f"{path}: directory release {release_name(source_release)} "
+                 f"does not match embedded {release_name(release)} marker")
+        target = target_from_elf(elf, release)
+        if target != "PPR_TARGET_ANY" and target != archive_target:
+            fail(f"{path}: embedded {target[len('PPR_TARGET_'):].lower()} "
+                 f"marker does not match "
+                 f"{archive_target[len('PPR_TARGET_'):].lower()} archive "
+                 "directory")
+        inventory.setdefault((release, target), []).append(path)
+    return inventory
+
+
+def discover_source_inventory(root):
     sources = {}
     aliases = {}
 
@@ -527,29 +625,13 @@ def discover_source_inventory(full_root, dram_root):
            source_matches_release(path, release):
             destination[release] = path
 
-    if full_root:
-        for directory in pathlib.Path(full_root).iterdir():
-            match = re.fullmatch(r"(\d+\.\d+(?:\.\d+)?)_mp4",
-                                 directory.name)
-            if not match:
-                continue
-            release = release_key(match.group(1))
-            for candidate in sorted(directory.rglob("a53.elf")):
-                consider(release, candidate)
-                if release in sources or release in aliases:
-                    break
-    if dram_root:
-        for directory in pathlib.Path(dram_root).iterdir():
-            release = release_key(directory.name)
-            candidate = directory / "mp4_dram.elf"
-            if release and candidate.is_file() and \
-               release not in sources and release not in aliases:
-                consider(release, candidate)
+    for release, _target, path in discover_archive_images(root):
+        consider(release, path)
     return sources, aliases
 
 
-def discover_sources(full_root, dram_root):
-    sources, _ = discover_source_inventory(full_root, dram_root)
+def discover_sources(root):
+    sources, _ = discover_source_inventory(root)
     return sources
 
 
@@ -906,6 +988,13 @@ def emit_profile(profile):
     return "\n".join(lines)
 
 
+def emit_target_profile(release, target, profile_index):
+    return (
+        f"    {{ {fmt32(firmware_value(release))}, {target}, "
+        f"{profile_index}U }}, /* {release_name(release)} "
+        f"{target[len('PPR_TARGET_'):].lower()} */")
+
+
 def validate_alias_profiles(sources, aliases, require_all=False):
     missing = [alias for alias in SOURCE_ALIASES if alias not in aliases]
     if require_all and missing:
@@ -925,20 +1014,53 @@ def validate_alias_profiles(sources, aliases, require_all=False):
                  f"{release_name(base)} in {', '.join(differences)}")
 
 
+def validate_target_profiles(sources, target_sources):
+    missing = [release for release in EXPECTED_RELEASES
+               if not any(key[0] == release for key in target_sources)]
+    if missing:
+        fail("missing target profiles: " + ", ".join(
+            release_name(release) for release in missing))
+
+    canonical = {
+        release: extract_profile(release, sources[release])
+        for release in EXPECTED_RELEASES
+    }
+    for (release, target), paths in target_sources.items():
+        for path in paths:
+            actual = extract_profile(release, path)
+            differences = [key for key in canonical[release]
+                           if canonical[release][key] != actual[key]]
+            if differences:
+                fail(f"{release_name(release)} {target} source {path} "
+                     f"differs from the canonical PPR profile in "
+                     f"{', '.join(differences)}")
+
+    index_by_release = {
+        release: index for index, release in enumerate(EXPECTED_RELEASES)
+    }
+    return [
+        (release, target, index_by_release[release])
+        for release, target in sorted(
+            target_sources,
+            key=lambda key: (key[0], TARGET_ORDER[key[1]]))
+    ]
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--full-root", type=pathlib.Path)
-    parser.add_argument("--dram-root", type=pathlib.Path)
+    parser.add_argument("--root", type=pathlib.Path, required=True,
+                        help="organized retail/devkit/testkit archive root")
     parser.add_argument("--output", type=pathlib.Path, required=True)
     args = parser.parse_args()
-    sources, aliases = discover_source_inventory(args.full_root,
-                                                 args.dram_root)
+    sources, aliases = discover_source_inventory(args.root)
     missing = [release for release in EXPECTED_RELEASES
                if release not in sources]
     if missing:
         fail("missing releases: " + ", ".join(
             f"{major}.{minor:02d}" for major, minor in missing))
     validate_alias_profiles(sources, aliases)
+    target_sources = discover_target_source_inventory(args.root)
+    target_profiles = validate_target_profiles(sources, target_sources)
     profiles = [extract_profile(release, sources[release])
                 for release in EXPECTED_RELEASES]
     generated = [
@@ -947,9 +1069,15 @@ def main():
         *(emit_profile(profile) for profile in profiles),
         "};",
         "",
+        "static const struct ppr_target_profile ppr_target_profiles[] = {",
+        *(emit_target_profile(*profile) for profile in target_profiles),
+        "};",
+        "",
     ]
-    args.output.write_text("\n".join(generated), encoding="utf-8")
-    print(f"generated {len(profiles)} exact profiles in {args.output}")
+    with args.output.open("w", encoding="utf-8", newline="\n") as output:
+        output.write("\n".join(generated))
+    print(f"generated {len(profiles)} unique PPR profiles and "
+          f"{len(target_profiles)} target profiles in {args.output}")
 
 
 if __name__ == "__main__":

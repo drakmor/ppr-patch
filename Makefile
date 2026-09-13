@@ -20,8 +20,7 @@ A53_ARM64_CC := $(PS5_PAYLOAD_SDK)/bin/clang
 A53_ARM64_LD := $(PS5_PAYLOAD_SDK)/bin/ld.lld
 A53_ARM64_OBJCOPY := $(PS5_PAYLOAD_SDK)/bin/llvm-objcopy
 
-PPR_FULL_ROOT ?= ../../MP4_1.00-12.00
-PPR_DRAM_ROOT ?= /mnt/j/PS5Dev/mp4
+PPR_ROOT ?= ../../mp4
 
 PATCHER := $(OUT)/a53_ppr_patcher.elf
 INSTALL := $(OUT)/a53_ppr_install.elf
@@ -55,7 +54,7 @@ $(INSTALL_FAST): $(SOURCES) $(PROFILE_INCLUDE) | $(OUT)
 	$(CC) $(CFLAGS) -DPPR_DEFAULT_ACTION=PPR_PATCH_INSTALL \
 		-DPPR_DEFAULT_IDLE_ACK=1 -DPPR_DEFAULT_FAST=1 \
 		-DPPR_DEFAULT_BATCH=1 -DPPR_DEFAULT_PERSISTENT=1 \
-		-DPPR_DEFAULT_MIXED_IO=1 \
+		-DPPR_DEFAULT_MIXED_IO=1 -DPPR_DEFAULT_TIME_ACCELERATION=1 \
 		-o $@ $(SOURCES)
 
 $(NATIVE): $(SOURCES) $(PROFILE_INCLUDE) | $(OUT)
@@ -92,10 +91,10 @@ $(KMB_RANGE_UNINSTALL): $(KMB_RANGE_SOURCES) $(KMB_RANGE_PROFILE_INCLUDE) \
 		-o $@ $(KMB_RANGE_SOURCES)
 
 profiles: generate_ppr_profiles.py generate_kmb_range_profiles.py
-	python3 generate_ppr_profiles.py --full-root $(PPR_FULL_ROOT) \
-		--dram-root $(PPR_DRAM_ROOT) --output $(PROFILE_INCLUDE)
-	python3 generate_kmb_range_profiles.py --full-root $(PPR_FULL_ROOT) \
-		--dram-root $(PPR_DRAM_ROOT) --output $(KMB_RANGE_PROFILE_INCLUDE)
+	python3 generate_ppr_profiles.py --root $(PPR_ROOT) \
+		--output $(PROFILE_INCLUDE)
+	python3 generate_kmb_range_profiles.py --root $(PPR_ROOT) \
+		--output $(KMB_RANGE_PROFILE_INCLUDE)
 
 verify: verify-ppr verify-kmb
 
@@ -105,12 +104,12 @@ verify-ppr: ppr_wrapper.S ppr_wrapper.ld ppr_patch.c ppr_patch.h \
 		--arm-cc $(A53_ARM64_CC) --arm-ld $(A53_ARM64_LD) \
 		--objcopy $(A53_ARM64_OBJCOPY) --source ppr_patch.c \
 		--asm ppr_wrapper.S --linker ppr_wrapper.ld \
-		--full-root $(PPR_FULL_ROOT) --dram-root $(PPR_DRAM_ROOT)
+		--root $(PPR_ROOT)
 
 verify-kmb: verify_kmb_range_profiles.py generate_kmb_range_profiles.py \
 		$(KMB_RANGE_PROFILE_INCLUDE)
-	python3 verify_kmb_range_profiles.py --full-root $(PPR_FULL_ROOT) \
-		--dram-root $(PPR_DRAM_ROOT) --profiles $(KMB_RANGE_PROFILE_INCLUDE)
+	python3 verify_kmb_range_profiles.py --root $(PPR_ROOT) \
+		--profiles $(KMB_RANGE_PROFILE_INCLUDE)
 
 host-test: host-test-ppr host-test-kmb host-test-notify
 

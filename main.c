@@ -31,6 +31,9 @@
 #ifndef PPR_DEFAULT_MIXED_IO
 #define PPR_DEFAULT_MIXED_IO 0
 #endif
+#ifndef PPR_DEFAULT_TIME_ACCELERATION
+#define PPR_DEFAULT_TIME_ACCELERATION 0
+#endif
 
 static void raise_fd_limit(void) {
     struct rlimit limit;
@@ -50,8 +53,9 @@ static void usage(const char *program) {
     puts("  --mode native --idle      select native mode");
     puts("  --mode plaintext-noauth --idle");
     puts("                            select FE/FF plaintext mode");
-    puts("transport options (read-only verified before use):");
+    puts("transport options (validated before use):");
     puts("  --fast --persistent --batch --mixed-io");
+    puts("  --time-acceleration       shorten each phase5 timeout dynamically");
     puts("  --conservative            disable all fast transports");
 }
 
@@ -64,6 +68,7 @@ int main(int argc, char **argv) {
         (enum ppr_patch_action)PPR_DEFAULT_ACTION;
     int idle_acknowledged = PPR_DEFAULT_IDLE_ACK;
     int fast_mode = PPR_DEFAULT_FAST;
+    int time_acceleration = PPR_DEFAULT_TIME_ACCELERATION;
     struct a53_transport_options options = {
         .persistent = PPR_DEFAULT_PERSISTENT,
         .batch = PPR_DEFAULT_BATCH,
@@ -112,12 +117,16 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--mixed-io") == 0) {
             transport_selected = 1;
             options.mixed_io = 1;
+        } else if (strcmp(argv[i], "--time-acceleration") == 0 ||
+                   strcmp(argv[i], "--short-timeout") == 0) {
+            time_acceleration = 1;
         } else if (strcmp(argv[i], "--conservative") == 0) {
             transport_selected = 1;
             fast_mode = 0;
             options.persistent = 0;
             options.batch = 0;
             options.mixed_io = 0;
+            time_acceleration = 0;
         } else if (strcmp(argv[i], "--help") == 0 ||
                    strcmp(argv[i], "-h") == 0) {
             usage(argv[0]);
@@ -150,6 +159,12 @@ int main(int argc, char **argv) {
     const struct a53_transport_options conservative = {0, 0, 0};
     if (a53_transport_initialize(&conservative) != 0)
         return 1;
+    if (time_acceleration) {
+        if (a53_transport_enable_time_acceleration() != 0) {
+            puts("[!] could not safely enable phase5 time acceleration");
+            return 1;
+        }
+    }
 
     char version[160];
     if (a53_transport_get_version(version, sizeof(version)) != 0) {
@@ -168,8 +183,11 @@ int main(int argc, char **argv) {
                system_firmware, a53_firmware);
 
     uint32_t target_firmware = a53_firmware ? a53_firmware : system_firmware;
-    if (!ppr_patch_firmware_supported(target_firmware)) {
-        printf("[!] no exact PPR profile for FW 0x%08x\n", target_firmware);
+    enum ppr_target_type target = ppr_patch_parse_target(version);
+    printf("[*] A53 target: %s\n", ppr_patch_target_name(target));
+    if (!ppr_patch_target_supported(target_firmware, target)) {
+        printf("[!] no exact PPR profile for FW 0x%08x target %s\n",
+               target_firmware, ppr_patch_target_name(target));
         return 1;
     }
 
@@ -183,8 +201,8 @@ int main(int argc, char **argv) {
 
     struct ppr_patch_transport transport;
     a53_transport_make_ppr(&transport, fast_mode);
-    int result = ppr_patch_run(&transport, target_firmware, action,
-                               idle_acknowledged);
+    int result = ppr_patch_run_target(&transport, target_firmware, target,
+                                      action, idle_acknowledged);
     ppr_notify_flush();
     return result == 0 ? 0 : 1;
 

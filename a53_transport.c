@@ -24,8 +24,6 @@
 #define DECI5S_DST_MP4      0x80FF0201U
 #define DECI5S_PROTO_SDBGP  0x20000201U
 #define DECI5S_DCMP         0x18U
-#define DECI5S_CODE         0x50U
-
 #define SDBGP_READ_MEMORY       0x01040021U
 #define SDBGP_WRITE_MEMORY      0x01040031U
 #define SDBGP_GET_CONF          0x01010010U
@@ -101,6 +99,7 @@ struct sdbgp_packet_result {
     uint64_t buffer;
     uint32_t buffer_size;
     uint32_t sequence_no;
+    uint32_t response_offset;
 };
 
 struct sdbgp_response_view {
@@ -121,6 +120,7 @@ _Static_assert(sizeof(struct sdbgp_read_result) == 0x28,
                "SDBGP result ABI");
 
 static int parse_read_response(const uint8_t *raw, size_t raw_size,
+                               size_t response_offset,
                                uint32_t sequence_no,
                                uint32_t response_command_count,
                                uint32_t command_number,
@@ -146,6 +146,19 @@ static int g_atexit_registered;
 static uint64_t g_transactions;
 static uint64_t g_transport_opens;
 static uint64_t g_elapsed_ticks;
+
+static struct clock_override_state {
+    uint64_t hz_addr;
+    uint32_t original_hz;
+    uint32_t accelerated_hz;
+    int enabled;
+    int active;
+    int restored;
+    int phase_seen;
+    int atexit_registered;
+    uint64_t phase_ticks;
+    uint64_t override_count;
+} g_clock_override;
 
 static uint32_t kread32(uint64_t address) {
     uint32_t value = 0;
@@ -175,6 +188,184 @@ static int kread64_checked(uint64_t address, uint64_t *value) {
 
 static int kwrite32(uint64_t address, uint32_t value) {
     return kernel_copyin(&value, address, sizeof(value));
+}
+
+static int restore_clock_override(const char *reason) {
+    if (!g_clock_override.active)
+        return 0;
+
+    for (int attempt = 0; attempt < 3; attempt++) {
+        if (kernel_copyin(&g_clock_override.original_hz,
+                          g_clock_override.hz_addr,
+                          sizeof(g_clock_override.original_hz)) == 0 &&
+            kread32(g_clock_override.hz_addr) ==
+                g_clock_override.original_hz) {
+            g_clock_override.active = 0;
+            g_clock_override.restored = 1;
+            return 0;
+        }
+    }
+    printf("[!] CRITICAL: failed to restore global hz at 0x%016lx (%s)\n",
+           (unsigned long)g_clock_override.hz_addr, reason);
+    return -1;
+}
+
+static void restore_clock_override_atexit(void) {
+    (void)restore_clock_override("atexit");
+}
+
+/* The phase5 worker computes its timeout as hz * tick_sbt.  KCODE is XOM,
+ * so find the standard clock globals from their unique value relationship
+ * in readable KDATA.  Refuse to write unless the complete scan yields one
+ * exact tick/tick_sbt/hz layout. */
+#define KERNEL_DATA_SCAN_CHUNK 0x10000U
+#define KERNEL_DATA_SCAN_CAP   0x04000000ULL
+#define KERNEL_CLOCK_MAX_PAIRS 64U
+#define KERNEL_CLOCK_SCAN_PREFIX 16U
+#define KERNEL_CLOCK_TICK_BACK   8U
+#define KERNEL_CLOCK_EARLY_HZ_BACK 0x0cU
+#define KERNEL_CLOCK_LATE_HZ_OFF 0x70ULL
+
+struct kernel_clock_pair {
+    uint64_t tick_sbt_addr;
+    uint64_t hz_addr;
+    uint64_t tick_sbt;
+    uint32_t hz;
+};
+
+static int locate_kernel_clock_pair(struct kernel_clock_pair *out) {
+    uint64_t start = (uint64_t)KERNEL_ADDRESS_DATA_BASE;
+    uint64_t end_anchor = (uint64_t)KERNEL_ADDRESS_ROOTVNODE;
+    uint64_t span = end_anchor > start ? end_anchor - start + 0x100000ULL : 0;
+    if (!out)
+        return -1;
+    if (span == 0 || span > KERNEL_DATA_SCAN_CAP)
+        span = KERNEL_DATA_SCAN_CAP;
+
+    printf("[*] dynamic clock scan: data=0x%016lx span=0x%lx\n",
+           (unsigned long)start, (unsigned long)span);
+
+    const size_t suffix = KERNEL_CLOCK_LATE_HZ_OFF + sizeof(uint32_t);
+    uint8_t *raw = malloc(KERNEL_DATA_SCAN_CHUNK +
+                          KERNEL_CLOCK_SCAN_PREFIX + suffix);
+    if (!raw)
+        return -1;
+
+    size_t equation_count = 0;
+    size_t pair_count = 0;
+    struct kernel_clock_pair candidate = {0};
+    for (uint64_t offset = 0; offset < span;
+         offset += KERNEL_DATA_SCAN_CHUNK) {
+        size_t core = KERNEL_DATA_SCAN_CHUNK;
+        if (span - offset < core)
+            core = (size_t)(span - offset);
+        size_t prefix = offset >= KERNEL_CLOCK_SCAN_PREFIX ?
+                        KERNEL_CLOCK_SCAN_PREFIX : 0;
+        size_t tail = (size_t)(span - offset - core);
+        if (tail > suffix)
+            tail = suffix;
+        size_t length = prefix + core + tail;
+        uint64_t read_address = start + offset - prefix;
+        if (kernel_copyout(read_address, raw, length) != 0) {
+            printf("[!] kernel data read failed at +0x%lx\n",
+                   (unsigned long)offset);
+            free(raw);
+            return -1;
+        }
+
+        for (size_t position = 0;
+             position + sizeof(uint64_t) <= core; position += 8) {
+            size_t index = prefix + position;
+            if (index < KERNEL_CLOCK_SCAN_PREFIX ||
+                index + suffix > length)
+                continue;
+
+            uint64_t tick_sbt = 0;
+            uint32_t tick_usec = 0;
+            uint32_t early_hz = 0;
+            uint32_t late_hz = 0;
+            memcpy(&tick_sbt, raw + index, sizeof(tick_sbt));
+            memcpy(&tick_usec, raw + index - KERNEL_CLOCK_TICK_BACK,
+                   sizeof(tick_usec));
+            memcpy(&early_hz,
+                   raw + index - KERNEL_CLOCK_EARLY_HZ_BACK,
+                   sizeof(early_hz));
+            memcpy(&late_hz, raw + index + KERNEL_CLOCK_LATE_HZ_OFF,
+                   sizeof(late_hz));
+
+            const uint32_t hz_values[2] = {early_hz, late_hz};
+            const int64_t hz_offsets[2] = {
+                -(int64_t)KERNEL_CLOCK_EARLY_HZ_BACK,
+                (int64_t)KERNEL_CLOCK_LATE_HZ_OFF,
+            };
+            const char *layout_names[2] = {"early", "late"};
+            for (size_t layout = 0; layout < 2; layout++) {
+                uint32_t hz = hz_values[layout];
+                if (hz < 10 || hz > 10000 ||
+                    tick_sbt != 0x100000000ULL / hz)
+                    continue;
+                equation_count++;
+                if (tick_usec != 1000000U / hz)
+                    continue;
+
+                uint64_t tick_sbt_address = start + offset + position;
+                uint64_t hz_address =
+                    (uint64_t)((int64_t)tick_sbt_address +
+                               hz_offsets[layout]);
+                printf("[*] %s clock signature: tick=%u "
+                       "tick_sbt@0x%016lx hz@0x%016lx hz=%u\n",
+                       layout_names[layout], tick_usec,
+                       (unsigned long)tick_sbt_address,
+                       (unsigned long)hz_address, hz);
+                candidate.tick_sbt_addr = tick_sbt_address;
+                candidate.hz_addr = hz_address;
+                candidate.tick_sbt = tick_sbt;
+                candidate.hz = hz;
+                if (++pair_count > KERNEL_CLOCK_MAX_PAIRS) {
+                    puts("[!] too many clock pairs; refusing ambiguity");
+                    free(raw);
+                    return -1;
+                }
+            }
+        }
+    }
+    free(raw);
+
+    printf("[*] tick_sbt/hz equation candidates: %lu\n",
+           (unsigned long)equation_count);
+    if (pair_count != 1) {
+        printf("[!] dynamic clock locator is ambiguous: %lu pairs\n",
+               (unsigned long)pair_count);
+        return -1;
+    }
+    *out = candidate;
+    return 0;
+}
+
+int a53_transport_enable_time_acceleration(void) {
+    struct kernel_clock_pair pair;
+    if (!g_initialized || locate_kernel_clock_pair(&pair) != 0)
+        return -1;
+    if (pair.hz < 100 || kread32(pair.hz_addr) != pair.hz ||
+        kread64(pair.tick_sbt_addr) != pair.tick_sbt) {
+        puts("[!] clock-pair validation changed; refusing time acceleration");
+        return -1;
+    }
+
+    memset(&g_clock_override, 0, sizeof(g_clock_override));
+    g_clock_override.hz_addr = pair.hz_addr;
+    g_clock_override.original_hz = pair.hz;
+    g_clock_override.accelerated_hz = pair.hz / 10;
+    if (atexit(restore_clock_override_atexit) != 0) {
+        puts("[!] could not register global-hz restore handler");
+        return -1;
+    }
+    g_clock_override.atexit_registered = 1;
+    g_clock_override.enabled = 1;
+    printf("[+] phase5 time acceleration armed dynamically: hz %u -> %u "
+           "during each kick only\n",
+           pair.hz, g_clock_override.accelerated_hz);
+    return 0;
 }
 
 static uint64_t swap_auth(uint64_t auth_id) {
@@ -277,6 +468,11 @@ static int initialize_mailbox(void) {
         perror("[!] ioctl ALTER_STATE");
         goto out;
     }
+    uint32_t reported_state = context[4] & 0xffffU;
+    uint32_t reported_phases = reported_state & ~0x10U;
+    int reported_state_valid = reported_phases == 3U ||
+                               reported_phases == 7U ||
+                               reported_phases == 0xfU;
 
     /* One coherent pre-FINISH snapshot replaces the overlapping scalar
      * kernel_copyout calls used to locate state/flags. */
@@ -288,17 +484,39 @@ static int initialize_mailbox(void) {
     uint64_t state_slot = 0;
     uint64_t flags_slot = 0;
     uint64_t buffer_slot = 0;
-    for (uint32_t offset = 8; offset < 0x1000; offset += 4) {
+    for (uint32_t offset = 4; offset < 0x1000; offset += 4) {
         uint32_t flags = 0;
-        uint32_t state = 0;
         memcpy(&flags, mp4_snapshot + offset, sizeof(flags));
-        memcpy(&state, mp4_snapshot + offset - 8, sizeof(state));
-        if ((flags & 0xffffU) == 0x212U &&
-            (state & ~0x10U) == 0xfU) {
-            state_slot = g_mp4sc + offset - 8;
+        if ((flags & 0xffffU) != 0x212U)
+            continue;
+
+        /* Early kernels keep state immediately before flags; newer kernels
+         * inserted one dword between them.  At this handshake boundary the
+         * completed phase bits form a prefix (3, 7, or 15).  Prefer the
+         * adjacent early layout so an accumulated coredump count at -8
+         * cannot be mistaken for state on 1.x-2.x. */
+        const uint32_t state_distances[2] = {4, 8};
+        for (size_t layout = 0; layout < 2; layout++) {
+            uint32_t distance = state_distances[layout];
+            if (offset < distance)
+                continue;
+            uint32_t state = 0;
+            memcpy(&state, mp4_snapshot + offset - distance,
+                   sizeof(state));
+            uint32_t phases = (state & 0xffffU) & ~0x10U;
+            if ((reported_state_valid &&
+                 (state & 0xffffU) != reported_state) ||
+                (!reported_state_valid && phases != 3U &&
+                 phases != 7U && phases != 0xfU))
+                continue;
+            state_slot = g_mp4sc + offset - distance;
             flags_slot = g_mp4sc + offset;
+            printf("[*] mailbox layout: %s state/flags spacing (%u bytes)\n",
+                   distance == 4 ? "early" : "late", distance);
             break;
         }
+        if (state_slot)
+            break;
     }
 
     uint32_t finish[2] = {8, 0};
@@ -406,6 +624,7 @@ static int open_transport_pair(int *fd_out, int *kq_out) {
 }
 
 void a53_transport_shutdown(void) {
+    (void)restore_clock_override("transport shutdown");
     if (g_transport_kq < 0 && g_transport_fd < 0)
         return;
     uint64_t original_auth = swap_auth(SYSCORE_AUTH_ID);
@@ -448,6 +667,7 @@ static int send_packet(struct deci5s_hdr *packet, uint32_t packet_length,
     uint64_t iommu = 0;
     uint64_t raw_buffer_size = 0;
     uint32_t request = 0;
+    int clock_error = 0;
     ++g_transactions;
     if (response)
         memset(response, 0, sizeof(*response));
@@ -516,16 +736,67 @@ static int send_packet(struct deci5s_hdr *packet, uint32_t packet_length,
     }
 
     if (kwrite32(g_mp4sc + 0x160, request) != 0 ||
-        kwrite32(g_mp4sc + 0x164, MP4_COREDUMP_CMD) != 0 ||
-        kwrite32(g_zcn_bar2 + 0xf6000, MP4_COREDUMP_CMD) != 0) {
+        kwrite32(g_mp4sc + 0x164, MP4_COREDUMP_CMD) != 0) {
+        puts("[!] failed to publish the coredump mailbox request");
+        goto out;
+    }
+
+    if (g_clock_override.enabled) {
+        if (kread32(g_clock_override.hz_addr) !=
+            g_clock_override.original_hz) {
+            puts("[!] global hz changed before accelerated kick; refusing write");
+            goto out;
+        }
+        /* Mark active first so every subsequent error path restores hz. */
+        g_clock_override.active = 1;
+        g_clock_override.restored = 0;
+        g_clock_override.phase_seen = 0;
+        g_clock_override.phase_ticks = 0;
+        if (kernel_copyin(&g_clock_override.accelerated_hz,
+                          g_clock_override.hz_addr,
+                          sizeof(g_clock_override.accelerated_hz)) != 0 ||
+            kread32(g_clock_override.hz_addr) !=
+                g_clock_override.accelerated_hz) {
+            puts("[!] global hz override write/readback failed");
+            (void)restore_clock_override("write failure");
+            goto out;
+        }
+        g_clock_override.override_count++;
+    }
+
+    uint64_t kick_started = sceKernelReadTsc();
+    if (kwrite32(g_zcn_bar2 + 0xf6000, MP4_COREDUMP_CMD) != 0) {
         puts("[!] failed to trigger the coredump mailbox request");
         goto out;
     }
 
     struct kevent event;
-    struct timespec timeout = {15, 0};
-    int events = kevent(kq, NULL, 0, &event, 1, &timeout);
-    if (events <= 0) {
+    int events = 0;
+    if (g_clock_override.active) {
+        struct timespec no_wait = {0, 0};
+        for (uint32_t iteration = 0; iteration < 15000; iteration++) {
+            if (g_clock_override.active &&
+                (kread32(g_state_addr) & 0x10U) != 0) {
+                g_clock_override.phase_seen = 1;
+                g_clock_override.phase_ticks =
+                    sceKernelReadTsc() - kick_started;
+                if (restore_clock_override("phase5 transition") != 0) {
+                    clock_error = 1;
+                    break;
+                }
+            }
+            events = kevent(kq, NULL, 0, &event, 1, &no_wait);
+            if (events != 0)
+                break;
+            usleep(1000);
+        }
+    } else {
+        struct timespec timeout = {15, 0};
+        events = kevent(kq, NULL, 0, &event, 1, &timeout);
+    }
+    if (clock_error) {
+        result = -4;
+    } else if (events <= 0) {
         if (events == 0)
             puts("[!] DECI5S response timeout");
         else
@@ -536,6 +807,11 @@ static int send_packet(struct deci5s_hdr *packet, uint32_t packet_length,
         result = -2;
     } else {
         result = 0;
+    }
+    if (result == 0 && g_clock_override.enabled &&
+        !g_clock_override.phase_seen) {
+        puts("[!] accelerated kick completed without observing phase5; refusing unverified timing");
+        result = -4;
     }
 
 out:
@@ -550,6 +826,9 @@ out:
                 result = -3;
         }
     }
+    if (g_clock_override.active &&
+        restore_clock_override("send cleanup") != 0)
+        result = -4;
     if (owns_pair) {
         if (kq >= 0)
             close(kq);
@@ -564,6 +843,10 @@ out:
         response->buffer = buffer;
         response->buffer_size = (uint32_t)raw_buffer_size;
         response->sequence_no = request;
+        /* The MP4 dump transport appends the response directly after the
+         * complete request packet.  Keeping this boundary avoids treating
+         * an older response left elsewhere in the aperture as current. */
+        response->response_offset = packet_length;
     }
     return result;
 }
@@ -578,8 +861,11 @@ static void initialize_outer(struct deci5s_cmd_hdr *header,
     header->header.dst = DECI5S_DST_MP4;
     header->header.protocol_id = DECI5S_PROTO_SDBGP;
     header->dcmp = DECI5S_DCMP;
-    header->code = count == 1 ? DECI5S_CODE
-                              : total_size - sizeof(struct deci5s_hdr);
+    /* SceDeci5sSdbgpHeader::total_size starts at the SDBGP header, not at
+     * the outer DECI5S header.  The legacy 0x50 constant is correct only for
+     * the 0x78-byte scalar READ_MEMORY request; GET_CONF is 0x60 bytes and
+     * therefore requires 0x38 here. */
+    header->code = total_size - sizeof(struct deci5s_hdr);
     header->num_commands = count;
 }
 
@@ -616,7 +902,8 @@ static int read_memory(uint64_t address, void *destination, uint32_t size) {
     if (!raw)
         return -1;
     int parsed = kernel_copyout(response.buffer, raw, scan_size) == 0 &&
-        parse_read_response(raw, scan_size, response.sequence_no, 1, 0,
+        parse_read_response(raw, scan_size, response.response_offset,
+                            response.sequence_no, 1, 0,
                             address, size, destination) == 0;
     free(raw);
     if (!parsed) {
@@ -657,78 +944,62 @@ static int write_memory(uint64_t address, const void *source, uint32_t size) {
 }
 
 static int locate_sdbgp_response(const uint8_t *raw, size_t raw_size,
+                                 size_t response_offset,
                                  uint32_t sequence_no,
                                  uint32_t response_command_count,
                                  struct sdbgp_response_view *view) {
-    struct sdbgp_response_view found = {0};
-    int matches = 0;
-
     if (!raw || !view || response_command_count == 0 ||
-        response_command_count > SDBGP_BATCH_READ_MAX)
+        response_command_count > SDBGP_BATCH_READ_MAX ||
+        response_offset > raw_size ||
+        sizeof(struct deci5s_cmd_hdr) > raw_size - response_offset)
         return -1;
 
-    /* /dev/mp4/dump prefixes the returned DECI5S packet with private data.
-     * Find one complete current response envelope, not an isolated result
-     * pattern.  The request packet may still be present in the same aperture;
-     * swapped src/dst and the echoed sequence distinguish it from the reply. */
-    for (size_t packet_offset = 0;
-         packet_offset + sizeof(struct deci5s_cmd_hdr) <= raw_size;
-         packet_offset += sizeof(uint32_t)) {
-        struct deci5s_cmd_hdr outer;
-        uint32_t command_count = 0;
-        memcpy(&outer, raw + packet_offset, sizeof(outer));
-        memcpy(&command_count, &outer.num_commands, sizeof(command_count));
+    /* /dev/mp4/dump retains the request at the start of the aperture and
+     * appends its response at the request-size boundary.  Validate that one
+     * current boundary instead of scanning stale tail bytes for lookalikes. */
+    struct deci5s_cmd_hdr outer;
+    uint32_t command_count = 0;
+    memcpy(&outer, raw + response_offset, sizeof(outer));
+    memcpy(&command_count, &outer.num_commands, sizeof(command_count));
 
-        if (outer.header.magic != DECI5S_MAGIC ||
-            outer.header.self_size != sizeof(struct deci5s_hdr) ||
-            outer.header.src != DECI5S_DST_MP4 ||
-            outer.header.dst != DECI5S_SRC_KERNEL ||
-            outer.header.protocol_id != DECI5S_PROTO_SDBGP ||
-            outer.header.packet_size < sizeof(struct deci5s_cmd_hdr) ||
-            outer.header.packet_size > raw_size - packet_offset ||
-            outer.dcmp != DECI5S_DCMP ||
-            outer.code != outer.header.packet_size - sizeof(struct deci5s_hdr) ||
-            outer.sequence_no != sequence_no || outer.packet_no != 0 ||
-            outer.attr != 1 || command_count != response_command_count)
-            continue;
+    if (outer.header.magic != DECI5S_MAGIC ||
+        outer.header.self_size != sizeof(struct deci5s_hdr) ||
+        outer.header.src != DECI5S_DST_MP4 ||
+        outer.header.dst != DECI5S_SRC_KERNEL ||
+        outer.header.protocol_id != DECI5S_PROTO_SDBGP ||
+        outer.header.packet_size < sizeof(struct deci5s_cmd_hdr) ||
+        outer.header.packet_size > raw_size - response_offset ||
+        outer.dcmp != DECI5S_DCMP ||
+        outer.code != outer.header.packet_size - sizeof(struct deci5s_hdr) ||
+        outer.sequence_no != sequence_no || outer.packet_no != 0 ||
+        outer.attr != 1 || command_count != response_command_count)
+        return -1;
 
-        size_t packet_end = packet_offset + outer.header.packet_size;
-        size_t command_offset = packet_offset + sizeof(outer);
-        uint32_t seen_commands = 0;
-        int valid = 1;
-        for (uint32_t i = 0; i < command_count; i++) {
-            struct sdbgp_command command;
-            if (command_offset + sizeof(command) > packet_end) {
-                valid = 0;
-                break;
-            }
-            memcpy(&command, raw + command_offset, sizeof(command));
-            if (command.self_size < sizeof(command) ||
-                command.total_size < command.self_size ||
-                command.total_size > packet_end - command_offset ||
-                command.command_no >= command_count ||
-                (seen_commands & (1U << command.command_no)) != 0) {
-                valid = 0;
-                break;
-            }
-            seen_commands |= 1U << command.command_no;
-            command_offset += command.total_size;
-        }
-        if (!valid || command_offset != packet_end ||
-            seen_commands != ((1U << command_count) - 1U))
-            continue;
-
-        if (matches++ != 0)
+    size_t packet_end = response_offset + outer.header.packet_size;
+    size_t command_offset = response_offset + sizeof(outer);
+    uint32_t seen_commands = 0;
+    for (uint32_t i = 0; i < command_count; i++) {
+        struct sdbgp_command command;
+        if (command_offset + sizeof(command) > packet_end)
             return -1;
-        found.packet_offset = packet_offset;
-        found.commands_offset = packet_offset + sizeof(outer);
-        found.packet_end = packet_end;
-        found.command_count = command_count;
+        memcpy(&command, raw + command_offset, sizeof(command));
+        if (command.self_size < sizeof(command) ||
+            command.total_size < command.self_size ||
+            command.total_size > packet_end - command_offset ||
+            command.command_no >= command_count ||
+            (seen_commands & (1U << command.command_no)) != 0)
+            return -1;
+        seen_commands |= 1U << command.command_no;
+        command_offset += command.total_size;
     }
-
-    if (matches != 1)
+    if (command_offset != packet_end ||
+        seen_commands != ((1U << command_count) - 1U))
         return -1;
-    *view = found;
+
+    view->packet_offset = response_offset;
+    view->commands_offset = response_offset + sizeof(outer);
+    view->packet_end = packet_end;
+    view->command_count = command_count;
     return 0;
 }
 
@@ -759,6 +1030,7 @@ static int find_response_command(const uint8_t *raw,
 }
 
 static int parse_read_response(const uint8_t *raw, size_t raw_size,
+                               size_t response_offset,
                                uint32_t sequence_no,
                                uint32_t response_command_count,
                                uint32_t command_number,
@@ -768,7 +1040,7 @@ static int parse_read_response(const uint8_t *raw, size_t raw_size,
     struct sdbgp_command command;
     size_t command_offset = 0;
     if (!destination || expected_size == 0 ||
-        locate_sdbgp_response(raw, raw_size, sequence_no,
+        locate_sdbgp_response(raw, raw_size, response_offset, sequence_no,
                               response_command_count, &view) != 0 ||
         find_response_command(raw, &view, command_number,
                               SDBGP_RES_READ_MEMORY, &command_offset,
@@ -857,9 +1129,9 @@ static int read_many(void *context, const uint64_t *addresses,
         return -1;
     }
     for (uint32_t i = 0; i < count; i++) {
-        if (parse_read_response(raw, scan_size, response.sequence_no, count,
-                                i, addresses[i], sizes[i], destinations[i]) !=
-            0) {
+        if (parse_read_response(raw, scan_size, response.response_offset,
+                                response.sequence_no, count, i, addresses[i],
+                                sizes[i], destinations[i]) != 0) {
             free(raw);
             return -1;
         }
@@ -967,9 +1239,9 @@ static int write_many_read_many(
         return -1;
     }
     for (uint32_t i = 0; i < count; i++) {
-        if (parse_read_response(raw, scan_size, response.sequence_no,
-                                count * 2U, i + count, addresses[i], sizes[i],
-                                destinations[i]) != 0) {
+        if (parse_read_response(raw, scan_size, response.response_offset,
+                                response.sequence_no, count * 2U, i + count,
+                                addresses[i], sizes[i], destinations[i]) != 0) {
             free(raw);
             return -1;
         }
@@ -1064,8 +1336,8 @@ int a53_transport_get_version(char *out, uint32_t out_size) {
     struct sdbgp_response_view view;
     struct sdbgp_command command;
     size_t command_offset = 0;
-    if (locate_sdbgp_response(raw, scan_size, response.sequence_no, 1,
-                              &view) != 0 ||
+    if (locate_sdbgp_response(raw, scan_size, response.response_offset,
+                              response.sequence_no, 1, &view) != 0 ||
         find_response_command(raw, &view, 0, SDBGP_RES_GET_CONF,
                               &command_offset, &command) != 0) {
         free(raw);

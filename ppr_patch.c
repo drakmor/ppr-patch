@@ -13,6 +13,9 @@
 #define PPR_PLAINTEXT_SIZE 0xa0U
 #define PPR_LAYOUT_HEADER_SIZE 0x148U
 #define PPR_LAYOUT_MAX_SEGMENTS 32U
+#define PPR_LAYOUT_VISITED_MASK 0x00030000U
+#define PPR_LAYOUT_IO_FIXED_INDEX_OFF 0x54U
+#define PPR_LAYOUT_IO_DEV_INDEX_OFF 0x74U
 #define PPR_MIXED_WRITE_MAX 8U
 
 struct ppr_layout_record {
@@ -31,6 +34,21 @@ struct ppr_layout_record {
 
 _Static_assert(sizeof(struct ppr_layout_record) == 0x50,
                "A53 layout record size");
+
+static int ppr_layout_flags_match(uint32_t flags, uint32_t expected) {
+    /* mp4_show_layout_info() uses bits 16 and 17 as traversal markers after
+     * printing the G6 and SRAM sides of a record.  Early releases can expose
+     * the table before that diagnostic has run, so those two bits are state,
+     * not part of the segment's semantic flags. */
+    return (flags & ~PPR_LAYOUT_VISITED_MASK) == expected;
+}
+
+static int ppr_layout_dev_flags_match(uint32_t flags) {
+    /* Both semantic encodings occur in valid DEV layout records.  Keep them
+     * firmware-independent while ignoring only the two traversal bits. */
+    return ppr_layout_flags_match(flags, 0x00000001U) ||
+           ppr_layout_flags_match(flags, 0x00000011U);
+}
 
 struct ppr_profile {
     uint32_t firmware;
@@ -78,6 +96,12 @@ struct ppr_profile {
     uint32_t precheck_stock;
     uint64_t dispatch_va;
     uint32_t dispatch_stock;
+};
+
+struct ppr_target_profile {
+    uint32_t firmware;
+    enum ppr_target_type target;
+    uint16_t profile_index;
 };
 
 /* Generated from the complete MP4 A53 ELF set. */
@@ -145,16 +169,96 @@ static void ppr_logf(const struct ppr_context *ctx, const char *format, ...) {
         ctx->transport->log(ctx->transport->context, message);
 }
 
-static const struct ppr_profile *ppr_find_profile(uint32_t firmware) {
-    for (size_t i = 0; i < sizeof(ppr_profiles) / sizeof(ppr_profiles[0]); i++) {
-        if (ppr_profiles[i].firmware == firmware)
-            return &ppr_profiles[i];
+static void ppr_log_layout_record(const struct ppr_context *ctx,
+                                  const char *role, uint32_t index,
+                                  const struct ppr_layout_record *record) {
+    ppr_logf(ctx,
+             "[*] PPR layout %s[%u]: id=%u flags=0x%08x "
+             "g6=0x%lx+0x%lx sram=0x%lx+0x%lx map=0x%lx+0x%lx",
+             role, index, record->id, record->flags,
+             (unsigned long)record->g6_base,
+             (unsigned long)record->g6_size,
+             (unsigned long)record->sram_base,
+             (unsigned long)record->sram_size,
+             (unsigned long)record->mapped_base,
+             (unsigned long)record->mapped_size);
+}
+
+static int ppr_target_valid(enum ppr_target_type target) {
+    switch (target) {
+    case PPR_TARGET_ANY:
+    case PPR_TARGET_RETAIL:
+    case PPR_TARGET_TESTKIT:
+    case PPR_TARGET_DEVKIT:
+        return 1;
     }
+    return 0;
+}
+
+static const struct ppr_profile *ppr_find_profile(
+        uint32_t firmware, enum ppr_target_type target) {
+    const struct ppr_profile *generic = NULL;
+    const struct ppr_profile *retail = NULL;
+    const struct ppr_profile *first = NULL;
+
+    if (!ppr_target_valid(target))
+        return NULL;
+
+    for (size_t i = 0;
+         i < sizeof(ppr_target_profiles) / sizeof(ppr_target_profiles[0]);
+         i++) {
+        const struct ppr_target_profile *entry = &ppr_target_profiles[i];
+        if (entry->firmware != firmware ||
+            entry->profile_index >=
+                sizeof(ppr_profiles) / sizeof(ppr_profiles[0]))
+            continue;
+        const struct ppr_profile *profile =
+            &ppr_profiles[entry->profile_index];
+        if (!first)
+            first = profile;
+        if (entry->target == PPR_TARGET_ANY)
+            generic = profile;
+        if (entry->target == PPR_TARGET_RETAIL)
+            retail = profile;
+        if (target != PPR_TARGET_ANY && entry->target == target)
+            return profile;
+    }
+    if (generic)
+        return generic;
+    if (target == PPR_TARGET_ANY)
+        return retail ? retail : first;
     return NULL;
 }
 
 int ppr_patch_firmware_supported(uint32_t firmware) {
-    return ppr_find_profile(firmware) != NULL;
+    return ppr_find_profile(firmware, PPR_TARGET_ANY) != NULL;
+}
+
+int ppr_patch_target_supported(uint32_t firmware,
+                               enum ppr_target_type target) {
+    return ppr_find_profile(firmware, target) != NULL;
+}
+
+enum ppr_target_type ppr_patch_parse_target(const char *version) {
+    if (!version)
+        return PPR_TARGET_ANY;
+    if (strstr(version, "devkit(") || strstr(version, "build.rev devkit"))
+        return PPR_TARGET_DEVKIT;
+    if (strstr(version, "testkit(") || strstr(version, "build.rev testkit"))
+        return PPR_TARGET_TESTKIT;
+    if (strstr(version, "cex(") || strstr(version, "build.rev cex"))
+        return PPR_TARGET_RETAIL;
+    return PPR_TARGET_ANY;
+}
+
+const char *ppr_patch_target_name(enum ppr_target_type target) {
+    switch (target) {
+    case PPR_TARGET_RETAIL:  return "retail";
+    case PPR_TARGET_TESTKIT: return "testkit";
+    case PPR_TARGET_DEVKIT:  return "devkit";
+    case PPR_TARGET_ANY:     return "unmarked";
+    }
+    return "invalid";
 }
 
 static int ppr_encode_branch26(uint32_t opcode, uint64_t from, uint64_t to,
@@ -273,6 +377,8 @@ static int ppr_read_layout(const struct ppr_context *ctx,
     uint8_t *snapshot = NULL;
     struct ppr_layout_record *records = NULL;
     uint32_t segment_count = 0;
+    uint32_t io_index = UINT32_MAX;
+    uint32_t dev_index = UINT32_MAX;
     int rc = -1;
 
     if (ctx->transport->fast_mode) {
@@ -289,8 +395,16 @@ static int ppr_read_layout(const struct ppr_context *ctx,
     }
 
     memcpy(&segment_count, header + 0x0c, sizeof(segment_count));
-    if (segment_count == 0 || segment_count > PPR_LAYOUT_MAX_SEGMENTS)
+    memcpy(&io_index, header + PPR_LAYOUT_IO_FIXED_INDEX_OFF,
+           sizeof(io_index));
+    memcpy(&dev_index, header + PPR_LAYOUT_IO_DEV_INDEX_OFF,
+           sizeof(dev_index));
+    if (segment_count == 0 || segment_count > PPR_LAYOUT_MAX_SEGMENTS) {
+        ppr_logf(ctx,
+                 "[!] PPR layout header mismatch: segments=%u io_index=%u dev_index=%u",
+                 segment_count, io_index, dev_index);
         goto out;
+    }
 
     size_t records_size =
         (size_t)segment_count * sizeof(struct ppr_layout_record);
@@ -307,7 +421,8 @@ static int ppr_read_layout(const struct ppr_context *ctx,
     const struct ppr_profile *p = ctx->profile;
     int have_io = p->merged_text, have_dev = 0;
     for (uint32_t i = 0; i < segment_count; i++) {
-        if (!p->merged_text && records[i].flags == 0x00030001U &&
+        if (!p->merged_text &&
+            ppr_layout_flags_match(records[i].flags, 0x00000001U) &&
             records[i].g6_base != 0 &&
             (records[i].g6_base & 0xfffU) == 0 &&
             records[i].g6_size == p->io_file_size &&
@@ -320,7 +435,7 @@ static int ppr_read_layout(const struct ppr_context *ctx,
             *io = records[i];
             have_io = 1;
         }
-        if (records[i].flags == 0x00010011U &&
+        if (ppr_layout_dev_flags_match(records[i].flags) &&
             records[i].g6_base != 0 &&
             (records[i].g6_base & 0xfffU) == 0 &&
             records[i].g6_size == p->dev_file_size &&
@@ -333,8 +448,28 @@ static int ppr_read_layout(const struct ppr_context *ctx,
             have_dev = 1;
         }
     }
-    if (!have_io || !have_dev)
+    if (!have_io || !have_dev) {
+        ppr_logf(ctx,
+                 "[!] PPR layout record mismatch: segments=%u io=%d dev=%d io_index=%u dev_index=%u",
+                 segment_count, have_io, have_dev, io_index, dev_index);
+        if (io_index < segment_count)
+            ppr_log_layout_record(ctx, "header-io", io_index,
+                                  &records[io_index]);
+        if (dev_index < segment_count && dev_index != io_index)
+            ppr_log_layout_record(ctx, "header-dev", dev_index,
+                                  &records[dev_index]);
+        for (uint32_t i = 0; i < segment_count; i++) {
+            if (i == io_index || i == dev_index)
+                continue;
+            if (records[i].mapped_base == p->io_mapped_base ||
+                records[i].mapped_base == p->dev_mapped_base ||
+                records[i].g6_size == p->io_file_size ||
+                records[i].g6_size == p->dev_file_size ||
+                records[i].sram_base == p->io_sram_base)
+                ppr_log_layout_record(ctx, "candidate", i, &records[i]);
+        }
         goto out;
+    }
 
     rc = 0;
 
@@ -980,9 +1115,10 @@ static void ppr_print_stats(const struct ppr_context *ctx) {
              (unsigned long)ticks);
 }
 
-int ppr_patch_run(const struct ppr_patch_transport *transport,
-                  uint32_t firmware, enum ppr_patch_action action,
-                  int idle_acknowledged) {
+int ppr_patch_run_target(const struct ppr_patch_transport *transport,
+                         uint32_t firmware, enum ppr_target_type target,
+                         enum ppr_patch_action action,
+                         int idle_acknowledged) {
     if (!transport || !transport->read || !transport->write)
         return -1;
     switch (action) {
@@ -998,12 +1134,13 @@ int ppr_patch_run(const struct ppr_patch_transport *transport,
                            "[!] invalid PPR patch action");
         return -1;
     }
-    const struct ppr_profile *profile = ppr_find_profile(firmware);
+    const struct ppr_profile *profile = ppr_find_profile(firmware, target);
     if (!profile) {
         if (transport->log) {
             char message[128];
             (void)snprintf(message, sizeof(message),
-                           "[!] unsupported PPR A53 firmware 0x%08x", firmware);
+                           "[!] unsupported PPR A53 firmware 0x%08x target %s",
+                           firmware, ppr_patch_target_name(target));
             transport->log(transport->context, message);
         }
         return -1;
@@ -1115,4 +1252,11 @@ int ppr_patch_run(const struct ppr_patch_transport *transport,
              : "[+] current PPR entry points restored to stock and read back");
     ppr_print_stats(&ctx);
     return 0;
+}
+
+int ppr_patch_run(const struct ppr_patch_transport *transport,
+                  uint32_t firmware, enum ppr_patch_action action,
+                  int idle_acknowledged) {
+    return ppr_patch_run_target(transport, firmware, PPR_TARGET_ANY, action,
+                                idle_acknowledged);
 }

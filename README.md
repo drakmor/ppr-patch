@@ -44,15 +44,19 @@ export PS5_PAYLOAD_SDK=/opt/ps5-payload-sdk
 make -j2
 ```
 
-The checked-in `ppr_profiles.inc` contains all 54 archived MP4 releases from
-1.00 through 11.40. The separate `kmb_range_profiles.inc` contains the 31
-verified KMB layouts from 4.00 through 10.60. `make profiles` regenerates both
-tables from `PPR_FULL_ROOT`
-(`../../MP4_1.00-12.00` by default), using `PPR_DRAM_ROOT`
-(`/mnt/j/PS5Dev/mp4`) as a fallback. `make verify` independently extracts and
-checks every profile against those ELFs. Source labels are accepted only when
-the embedded AArch64 ELF contains the matching release marker, so a mislabeled
-full image cannot shadow the correct DRAM fallback. The available `6.00.01`,
+The checked-in `ppr_profiles.inc` contains 55 unique PPR layouts and 89
+target-specific `FW + retail/testkit/devkit` mappings from 1.00 through 11.40,
+including 6.02 and 9.05. Profiles that are byte-identical across targets share
+one layout entry, but the runtime still requires the exact target mapping. The separate
+`kmb_range_profiles.inc` contains the 32 verified KMB layouts from 4.00 through
+10.60. `make profiles` regenerates both tables from the organized `PPR_ROOT`
+archive (`../../mp4` by default), whose first-level directories are `retail`,
+`devkit`, and `testkit`.
+`make verify` independently extracts and checks every profile against those
+ELFs. Source labels are accepted only when the embedded AArch64 ELF contains
+the matching release marker and any explicit target marker agrees with its
+directory, so a misplaced image fails closed.
+The available `6.00.01`,
 `7.01.01`, and `8.20.02` images are verified as exact aliases of `6.00`,
 `7.01`, and `8.20`; they share the same runtime firmware IDs and therefore do
 not create duplicate profile rows.
@@ -61,8 +65,8 @@ Artifacts are written to `build/`:
 
 - `a53_ppr_patcher.elf` — argument-driven status/control payload;
 - `a53_ppr_install.elf` — install using the verified pair-only fast transport;
-- `a53_ppr_install_fast.elf` — compatibility-named alias with the same action
-  and transport defaults;
+- `a53_ppr_install_fast.elf` — the same install action with dynamic phase5
+  time acceleration enabled in addition to the fast transport defaults;
 - `a53_ppr_plaintext.elf` — install alias for launchers without arguments;
 - `a53_ppr_native.elf` — stock-restore alias for launchers without arguments;
 - `a53_ppr_uninstall.elf` — restore the exact stock entry instructions;
@@ -99,6 +103,24 @@ fallbacks remain available. Every response is bounded by its complete
 DECI5S/SDBGP envelope and must echo the current request sequence; stale result
 records left by an earlier, longer packet are rejected.
 
+The fast installer also locates the kernel `tick`, `tick_sbt`, and `hz`
+globals dynamically from their exact value relationship in readable KDATA.
+It requires one unique match, changes `hz` to one tenth of its original value
+immediately before each MP4 kick, and restores it as soon as the dynamically
+located mailbox state enters phase5. Readback, cleanup, and `atexit` restoration
+are mandatory; any locator, write, or restore failure aborts the payload. This
+contains the global-clock write to the short phase-transition window and does
+not use firmware-specific clock addresses. The locator accepts both the early
+`hz, tick, tick_sbt` clock layout used by 2.50 and the later split layout, while
+mailbox discovery accepts both four-byte and eight-byte `state`/`flags`
+spacing and cross-checks the state reported by the ioctl when available.
+The PPR layout validator also ignores only the two `mp4_show_layout_info()`
+traversal-marker bits in each record. Early firmware can expose the same exact
+segment map before that diagnostic has marked its G6/SRAM entries as visited.
+DEV IO-controller DRAM-text records accept either observed semantic encoding,
+`0x0001` or `0x0011`, on every firmware. Both cases retain the same strict
+geometry, backing, and uniqueness validation.
+
 For a clean fixed-action install, GET_CONF costs one transaction. A successful
 capability probe then costs two transactions and one open, whose descriptor is
 retained. The clean install uses another eleven transactions: one layout
@@ -118,6 +140,7 @@ these reads and writes.
 --mode native --idle
 --mode plaintext-noauth --idle
 --fast --persistent --batch --mixed-io
+--time-acceleration
 --conservative
 ```
 
@@ -228,7 +251,7 @@ not link `ppr_patch.c`. It validates one exact DEV-layout snapshot, performs
 one instruction-state read, and only when a change is needed performs one
 write plus one readback. The current word must exactly match the profile's
 stock or patched word. `a53_kmb_range_uninstall.elf` restores the exact
-profile-specific stock instruction. The standalone table covers all 31
+profile-specific stock instruction. The standalone table covers all 32
 archived 4.00-through-10.60 profiles; 1.x through 3.x and 11.x fail as
 unsupported before any write, without affecting selector support.
 If the mutation readback fails, the payload makes a best-effort exact restore
@@ -274,13 +297,13 @@ make verify
 make host-test
 ```
 
-`make verify` checks all 54 supplied A53 ELFs, the three patch-version aliases,
-all thirteen selector sites and
+`make verify` checks all 55 unique layouts, all 89 target mappings and their
+available source images, the three patch-version aliases, all thirteen selector sites and
 branch targets, the native AES and stock plaintext descriptor builders, the
 terminal SHA release/submit layout, executable-tail placement, exact FE/FF
 selector semantics, and byte-for-byte equality of C-generated and assembled
 wrappers. Its separate KMB verifier checks the exact 20-word FsWrite context,
-DEV layout, site, stock word, and replacement branch for all 31 KMB profiles.
+DEV layout, site, stock word, and replacement branch for all 32 KMB profiles.
 
 `make host-test` exercises status, idle gating, install, interrupted-state
 recovery, uninstall, unknown-instruction rejection, and unsupported-profile

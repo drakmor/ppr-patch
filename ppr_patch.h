@@ -11,6 +11,13 @@ enum ppr_patch_action {
     PPR_PATCH_MODE_PLAINTEXT_NOAUTH,
 };
 
+enum ppr_target_type {
+    PPR_TARGET_ANY = 0,
+    PPR_TARGET_RETAIL,
+    PPR_TARGET_TESTKIT,
+    PPR_TARGET_DEVKIT,
+};
+
 /*
  * The PPR patcher deliberately knows nothing about the PS5 kernel API or the
  * DECI5S packet format.  A frontend supplies the transport operations
@@ -56,6 +63,15 @@ struct ppr_patch_transport {
 #define PPR_PATCH_LAYOUT_PA 0x887F0000ULL
 
 int ppr_patch_firmware_supported(uint32_t firmware);
+int ppr_patch_target_supported(uint32_t firmware,
+                               enum ppr_target_type target);
+enum ppr_target_type ppr_patch_parse_target(const char *version);
+const char *ppr_patch_target_name(enum ppr_target_type target);
+int ppr_patch_run_target(const struct ppr_patch_transport *transport,
+                         uint32_t firmware, enum ppr_target_type target,
+                         enum ppr_patch_action action,
+                         int idle_acknowledged);
+/* Compatibility entry point: prefers a generic or retail profile. */
 int ppr_patch_run(const struct ppr_patch_transport *transport,
                   uint32_t firmware, enum ppr_patch_action action,
                   int idle_acknowledged);

@@ -17,6 +17,13 @@ ABI_NUMBERS = {
     "PPR_ABI_LATE": 2,
 }
 
+TARGET_NUMBERS = {
+    "PPR_TARGET_ANY": 0,
+    "PPR_TARGET_RETAIL": 1,
+    "PPR_TARGET_TESTKIT": 2,
+    "PPR_TARGET_DEVKIT": 3,
+}
+
 
 def fail(message):
     raise SystemExit(f"PPR profile verification failed: {message}")
@@ -106,6 +113,13 @@ int main(void) {
             printf(" %08x", ctx.images.legacy_hook[i]);
         printf("\n");
     }
+    for (size_t n = 0;
+         n < sizeof(ppr_target_profiles) / sizeof(ppr_target_profiles[0]);
+         n++) {
+        const struct ppr_target_profile *p = &ppr_target_profiles[n];
+        printf("T %08x %d %u\n", p->firmware, p->target,
+               p->profile_index);
+    }
     return 0;
 }
 '''
@@ -130,6 +144,7 @@ def read_compiled_profiles(source, host_cc, temp):
          str(harness), "-o", str(executable)])
     output = run([str(executable)], capture_output=True, text=True).stdout
     profiles = {}
+    targets = []
     current = None
     for line in output.splitlines():
         fields = line.split()
@@ -141,6 +156,9 @@ def read_compiled_profiles(source, host_cc, temp):
                 "cave_in_dev": int(fields[5]),
             }
             profiles[current["firmware"]] = current
+        elif kind == "T":
+            targets.append((int(fields[1], 16), int(fields[2]),
+                            int(fields[3])))
         elif current is None:
             fail("harness emitted data before a profile")
         elif kind == "V":
@@ -162,7 +180,7 @@ def read_compiled_profiles(source, host_cc, temp):
             current[key] = [int(value, 16) for value in fields[1:]]
         else:
             fail(f"unknown harness record: {line}")
-    return profiles
+    return profiles, targets
 
 
 def link_wrapper(profile, args, temp):
@@ -350,29 +368,36 @@ def main():
     parser.add_argument("--source", type=pathlib.Path, required=True)
     parser.add_argument("--asm", type=pathlib.Path, required=True)
     parser.add_argument("--linker", type=pathlib.Path, required=True)
-    parser.add_argument("--full-root", type=pathlib.Path)
-    parser.add_argument("--dram-root", type=pathlib.Path)
+    parser.add_argument("--root", type=pathlib.Path, required=True)
     args = parser.parse_args()
 
-    sources, aliases = generator.discover_source_inventory(
-        args.full_root, args.dram_root)
+    sources, aliases = generator.discover_source_inventory(args.root)
     missing = [release for release in generator.EXPECTED_RELEASES
                if release not in sources]
     if missing:
         fail("missing releases: " + ", ".join(
             f"{major}.{minor:02d}" for major, minor in missing))
     generator.validate_alias_profiles(sources, aliases, require_all=True)
+    target_sources = generator.discover_target_source_inventory(args.root)
+    expected_targets = generator.validate_target_profiles(sources,
+                                                           target_sources)
 
     with tempfile.TemporaryDirectory(prefix="ppr-profile-check-") as name:
         temp = pathlib.Path(name)
-        profiles = read_compiled_profiles(args.source.resolve(),
-                                          args.host_cc, temp)
+        profiles, targets = read_compiled_profiles(args.source.resolve(),
+                                                   args.host_cc, temp)
         expected_firmwares = {
             generator.firmware_value(release)
             for release in generator.EXPECTED_RELEASES
         }
         if set(profiles) != expected_firmwares:
             fail("compiled profile set is incomplete or contains extras")
+        normalized_targets = [
+            (generator.firmware_value(release), TARGET_NUMBERS[target], index)
+            for release, target, index in expected_targets
+        ]
+        if targets != normalized_targets:
+            fail("compiled target-profile matrix differs from source analysis")
         for release in generator.EXPECTED_RELEASES:
             firmware = generator.firmware_value(release)
             expected = generator.extract_profile(release, sources[release])
@@ -382,9 +407,10 @@ def main():
             verify_wrapper_semantics(actual)
             verify_wrapper(actual, args, temp)
 
-    print("PPR profile verification passed: 54 releases from 1.00 through "
-          "11.40, exact sites, three ABIs, caves, aliases, and generated "
-          "wrappers")
+    print(f"PPR profile verification passed: "
+          f"{len(generator.EXPECTED_RELEASES)} releases from 1.00 through "
+          f"11.40, {len(expected_targets)} target profiles, exact sites, "
+          "three ABIs, caves, aliases, and generated wrappers")
 
 
 if __name__ == "__main__":

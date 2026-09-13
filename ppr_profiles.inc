@@ -1893,6 +1893,50 @@ static const struct ppr_profile ppr_profiles[] = {
         .dispatch_stock = 0x97ffeff4U,
     },
     {
+        .firmware = 0x09050000U, .name = "9.05",
+        .abi = PPR_ABI_CURRENT, .merged_text = 0,
+        .cave_in_dev = 0,
+        .io_mapped_base = 0x04e27000ULL,
+        .io_file_size = 0x00035a54ULL, .io_mapped_size = 0x00036000ULL,
+        .io_sram_base = 0x00027000ULL,
+        .dev_mapped_base = 0x06411000ULL,
+        .dev_file_size = 0x00032e00ULL, .dev_mapped_size = 0x00033000ULL,
+        .runtime_cave_va = 0x04e5cf00ULL,
+        .plaintext_cave_va = 0x04e5cf50ULL,
+        .helper_va = 0x04e5a6bcULL,
+        .precheck_normal_va = 0x04e5a73cULL,
+        .precheck_special_va = 0x04e5a770ULL,
+        .common_error_va = 0x04e5a89cULL,
+        .dispatch_native_va = 0x04e56840ULL,
+        .aes_descriptor_va = 0x04e29e54ULL,
+        .plaintext_descriptor_va = 0x04e2a038ULL,
+        .plaintext_direct_va = 0x04e5b564ULL,
+        .plaintext_idma_va = 0x04e57300ULL,
+        .sha_wait_idma_aes_va = 0x04e57794ULL,
+        .sha_authenticate_va = 0x04e57884ULL,
+        .submit_idma_va = 0x04e55348ULL,
+        .common_return_va = 0x04e5a9acULL,
+        .call_va = {
+            0x04e4879cULL, 0x04e49048ULL, 0x06414f1cULL,
+            0x06416118ULL, 0x064163a8ULL, 0x0641663cULL,
+            0x06417c50ULL, 0x0642313cULL, 0x064251dcULL,
+            0x064278d0ULL,
+        },
+        .call_stock = {
+            0x940047c8U, 0x9400459dU, 0x97a915e8U, 0x97a91169U,
+            0x97a910c5U, 0x97a91020U, 0x97a90a9bU, 0x97a8dd60U,
+            0x97a8d538U, 0x97a8cb7bU,
+        },
+        .aes_site_va = {0x04e569a8ULL, 0x04e56ad4ULL},
+        .aes_site_stock = {0x97ff4d2bU, 0x97ff4ce0U},
+        .sha_auth_site_va = 0x04e5a974ULL,
+        .sha_auth_site_stock = 0x97fff3c4U,
+        .precheck_va = 0x04e5a738ULL,
+        .precheck_stock = 0x35000b38U,
+        .dispatch_va = 0x04e5a870ULL,
+        .dispatch_stock = 0x97ffeff4U,
+    },
+    {
         .firmware = 0x09200000U, .name = "9.20",
         .abi = PPR_ABI_CURRENT, .merged_text = 0,
         .cave_in_dev = 0,
@@ -2376,4 +2420,96 @@ static const struct ppr_profile ppr_profiles[] = {
         .dispatch_va = 0x04e5ad74ULL,
         .dispatch_stock = 0x97fff02dU,
     },
+};
+
+static const struct ppr_target_profile ppr_target_profiles[] = {
+    { 0x01000000U, PPR_TARGET_ANY, 0U }, /* 1.00 any */
+    { 0x01010000U, PPR_TARGET_ANY, 1U }, /* 1.01 any */
+    { 0x01020000U, PPR_TARGET_ANY, 2U }, /* 1.02 any */
+    { 0x01050000U, PPR_TARGET_ANY, 3U }, /* 1.05 any */
+    { 0x01100000U, PPR_TARGET_ANY, 4U }, /* 1.10 any */
+    { 0x01110000U, PPR_TARGET_ANY, 5U }, /* 1.11 any */
+    { 0x01120000U, PPR_TARGET_ANY, 6U }, /* 1.12 any */
+    { 0x01130000U, PPR_TARGET_ANY, 7U }, /* 1.13 any */
+    { 0x01140000U, PPR_TARGET_ANY, 8U }, /* 1.14 any */
+    { 0x02000000U, PPR_TARGET_ANY, 9U }, /* 2.00 any */
+    { 0x02200000U, PPR_TARGET_ANY, 10U }, /* 2.20 any */
+    { 0x02250000U, PPR_TARGET_ANY, 11U }, /* 2.25 any */
+    { 0x02260000U, PPR_TARGET_ANY, 12U }, /* 2.26 any */
+    { 0x02300000U, PPR_TARGET_ANY, 13U }, /* 2.30 any */
+    { 0x02500000U, PPR_TARGET_ANY, 14U }, /* 2.50 any */
+    { 0x02700000U, PPR_TARGET_ANY, 15U }, /* 2.70 any */
+    { 0x03000000U, PPR_TARGET_ANY, 16U }, /* 3.00 any */
+    { 0x03100000U, PPR_TARGET_ANY, 17U }, /* 3.10 any */
+    { 0x03200000U, PPR_TARGET_ANY, 18U }, /* 3.20 any */
+    { 0x03210000U, PPR_TARGET_ANY, 19U }, /* 3.21 any */
+    { 0x04000000U, PPR_TARGET_RETAIL, 20U }, /* 4.00 retail */
+    { 0x04000000U, PPR_TARGET_TESTKIT, 20U }, /* 4.00 testkit */
+    { 0x04000000U, PPR_TARGET_DEVKIT, 20U }, /* 4.00 devkit */
+    { 0x04020000U, PPR_TARGET_RETAIL, 21U }, /* 4.02 retail */
+    { 0x04020000U, PPR_TARGET_DEVKIT, 21U }, /* 4.02 devkit */
+    { 0x04030000U, PPR_TARGET_RETAIL, 22U }, /* 4.03 retail */
+    { 0x04030000U, PPR_TARGET_DEVKIT, 22U }, /* 4.03 devkit */
+    { 0x04500000U, PPR_TARGET_RETAIL, 23U }, /* 4.50 retail */
+    { 0x04500000U, PPR_TARGET_DEVKIT, 23U }, /* 4.50 devkit */
+    { 0x04510000U, PPR_TARGET_RETAIL, 24U }, /* 4.51 retail */
+    { 0x04510000U, PPR_TARGET_TESTKIT, 24U }, /* 4.51 testkit */
+    { 0x04510000U, PPR_TARGET_DEVKIT, 24U }, /* 4.51 devkit */
+    { 0x05000000U, PPR_TARGET_RETAIL, 25U }, /* 5.00 retail */
+    { 0x05020000U, PPR_TARGET_RETAIL, 26U }, /* 5.02 retail */
+    { 0x05020000U, PPR_TARGET_DEVKIT, 26U }, /* 5.02 devkit */
+    { 0x05100000U, PPR_TARGET_RETAIL, 27U }, /* 5.10 retail */
+    { 0x05100000U, PPR_TARGET_DEVKIT, 27U }, /* 5.10 devkit */
+    { 0x05500000U, PPR_TARGET_RETAIL, 28U }, /* 5.50 retail */
+    { 0x05500000U, PPR_TARGET_DEVKIT, 28U }, /* 5.50 devkit */
+    { 0x06000000U, PPR_TARGET_RETAIL, 29U }, /* 6.00 retail */
+    { 0x06000000U, PPR_TARGET_DEVKIT, 29U }, /* 6.00 devkit */
+    { 0x06020000U, PPR_TARGET_RETAIL, 30U }, /* 6.02 retail */
+    { 0x06020000U, PPR_TARGET_DEVKIT, 30U }, /* 6.02 devkit */
+    { 0x06500000U, PPR_TARGET_RETAIL, 31U }, /* 6.50 retail */
+    { 0x06500000U, PPR_TARGET_DEVKIT, 31U }, /* 6.50 devkit */
+    { 0x07000000U, PPR_TARGET_RETAIL, 32U }, /* 7.00 retail */
+    { 0x07000000U, PPR_TARGET_DEVKIT, 32U }, /* 7.00 devkit */
+    { 0x07010000U, PPR_TARGET_RETAIL, 33U }, /* 7.01 retail */
+    { 0x07010000U, PPR_TARGET_DEVKIT, 33U }, /* 7.01 devkit */
+    { 0x07200000U, PPR_TARGET_RETAIL, 34U }, /* 7.20 retail */
+    { 0x07200000U, PPR_TARGET_DEVKIT, 34U }, /* 7.20 devkit */
+    { 0x07400000U, PPR_TARGET_RETAIL, 35U }, /* 7.40 retail */
+    { 0x07400000U, PPR_TARGET_DEVKIT, 35U }, /* 7.40 devkit */
+    { 0x07600000U, PPR_TARGET_RETAIL, 36U }, /* 7.60 retail */
+    { 0x07600000U, PPR_TARGET_DEVKIT, 36U }, /* 7.60 devkit */
+    { 0x07610000U, PPR_TARGET_RETAIL, 37U }, /* 7.61 retail */
+    { 0x07610000U, PPR_TARGET_DEVKIT, 37U }, /* 7.61 devkit */
+    { 0x08000000U, PPR_TARGET_RETAIL, 38U }, /* 8.00 retail */
+    { 0x08000000U, PPR_TARGET_DEVKIT, 38U }, /* 8.00 devkit */
+    { 0x08200000U, PPR_TARGET_RETAIL, 39U }, /* 8.20 retail */
+    { 0x08200000U, PPR_TARGET_DEVKIT, 39U }, /* 8.20 devkit */
+    { 0x08400000U, PPR_TARGET_RETAIL, 40U }, /* 8.40 retail */
+    { 0x08400000U, PPR_TARGET_DEVKIT, 40U }, /* 8.40 devkit */
+    { 0x08600000U, PPR_TARGET_RETAIL, 41U }, /* 8.60 retail */
+    { 0x08600000U, PPR_TARGET_DEVKIT, 41U }, /* 8.60 devkit */
+    { 0x09000000U, PPR_TARGET_RETAIL, 42U }, /* 9.00 retail */
+    { 0x09000000U, PPR_TARGET_DEVKIT, 42U }, /* 9.00 devkit */
+    { 0x09050000U, PPR_TARGET_RETAIL, 43U }, /* 9.05 retail */
+    { 0x09200000U, PPR_TARGET_RETAIL, 44U }, /* 9.20 retail */
+    { 0x09200000U, PPR_TARGET_DEVKIT, 44U }, /* 9.20 devkit */
+    { 0x09400000U, PPR_TARGET_RETAIL, 45U }, /* 9.40 retail */
+    { 0x09400000U, PPR_TARGET_DEVKIT, 45U }, /* 9.40 devkit */
+    { 0x09600000U, PPR_TARGET_RETAIL, 46U }, /* 9.60 retail */
+    { 0x09600000U, PPR_TARGET_DEVKIT, 46U }, /* 9.60 devkit */
+    { 0x10000000U, PPR_TARGET_RETAIL, 47U }, /* 10.00 retail */
+    { 0x10000000U, PPR_TARGET_DEVKIT, 47U }, /* 10.00 devkit */
+    { 0x10010000U, PPR_TARGET_RETAIL, 48U }, /* 10.01 retail */
+    { 0x10010000U, PPR_TARGET_DEVKIT, 48U }, /* 10.01 devkit */
+    { 0x10200000U, PPR_TARGET_RETAIL, 49U }, /* 10.20 retail */
+    { 0x10200000U, PPR_TARGET_DEVKIT, 49U }, /* 10.20 devkit */
+    { 0x10400000U, PPR_TARGET_RETAIL, 50U }, /* 10.40 retail */
+    { 0x10400000U, PPR_TARGET_DEVKIT, 50U }, /* 10.40 devkit */
+    { 0x10600000U, PPR_TARGET_RETAIL, 51U }, /* 10.60 retail */
+    { 0x10600000U, PPR_TARGET_DEVKIT, 51U }, /* 10.60 devkit */
+    { 0x11000000U, PPR_TARGET_RETAIL, 52U }, /* 11.00 retail */
+    { 0x11000000U, PPR_TARGET_DEVKIT, 52U }, /* 11.00 devkit */
+    { 0x11200000U, PPR_TARGET_RETAIL, 53U }, /* 11.20 retail */
+    { 0x11400000U, PPR_TARGET_RETAIL, 54U }, /* 11.40 retail */
+    { 0x11400000U, PPR_TARGET_DEVKIT, 54U }, /* 11.40 devkit */
 };

@@ -333,11 +333,34 @@ int main(void) {
 
     assert(ppr_patch_firmware_supported(0x01000000U));
     assert(ppr_patch_firmware_supported(0x04030000U));
+    assert(ppr_patch_firmware_supported(0x06020000U));
     assert(ppr_patch_firmware_supported(0x07610000U));
+    assert(ppr_patch_firmware_supported(0x09050000U));
     assert(ppr_patch_firmware_supported(0x09400000U));
     assert(ppr_patch_firmware_supported(0x09600000U));
     assert(ppr_patch_firmware_supported(0x11400000U));
     assert(!ppr_patch_firmware_supported(0x12000000U));
+    assert(ppr_patch_target_supported(0x04510000U, PPR_TARGET_RETAIL));
+    assert(ppr_patch_target_supported(0x04510000U, PPR_TARGET_TESTKIT));
+    assert(ppr_patch_target_supported(0x04510000U, PPR_TARGET_DEVKIT));
+    assert(ppr_patch_target_supported(0x09400000U, PPR_TARGET_DEVKIT));
+    assert(!ppr_patch_target_supported(0x09050000U,
+                                       PPR_TARGET_DEVKIT));
+    assert(!ppr_patch_target_supported(
+        0x01000000U, (enum ppr_target_type)99));
+    assert(ppr_patch_parse_target("cex(1):Oberon-KDE") ==
+           PPR_TARGET_RETAIL);
+    assert(ppr_patch_parse_target("testkit(1):Oberon-KDE") ==
+           PPR_TARGET_TESTKIT);
+    assert(ppr_patch_parse_target("devkit(1):Oberon-KDE") ==
+           PPR_TARGET_DEVKIT);
+    assert(ppr_patch_parse_target("Oberon-KDE;host has build.rev cex") ==
+           PPR_TARGET_RETAIL);
+    assert(ppr_patch_parse_target("Oberon-KDE") == PPR_TARGET_ANY);
+
+    assert(ppr_patch_run_target(&transport, 0x09050000U,
+                                PPR_TARGET_DEVKIT, PPR_PATCH_STATUS, 0) != 0);
+    assert(mock.writes == 0);
 
     assert(ppr_patch_run(&transport, 0x09400000U,
                          (enum ppr_patch_action)99, 1) != 0);
@@ -369,6 +392,25 @@ int main(void) {
     memcpy(mock.layout + 0x0c, &duplicate_segment_count,
            sizeof(duplicate_segment_count));
     memset(&layout_records[2], 0, sizeof(layout_records[2]));
+
+    /* Bits 16/17 are mp4_show_layout_info() traversal markers.  The live
+     * table is equally valid before the diagnostic has marked either side. */
+    layout_records[0].flags = 0x00000001U;
+    layout_records[1].flags = 0x00000011U;
+    assert(ppr_patch_run(&transport, 0x09400000U,
+                         PPR_PATCH_STATUS, 0) == 0);
+    assert(mock.writes == 0);
+    layout_records[1].flags = 0x00010001U;
+    assert(ppr_patch_run(&transport, 0x09400000U,
+                         PPR_PATCH_STATUS, 0) == 0);
+    assert(mock.writes == 0);
+    layout_records[1].flags = 0x00010011U;
+    layout_records[0].flags = 0x00040001U;
+    assert(ppr_patch_run(&transport, 0x09400000U,
+                         PPR_PATCH_STATUS, 0) != 0);
+    assert(mock.writes == 0);
+    layout_records[0].flags = 0x00030001U;
+    layout_records[1].flags = 0x00010011U;
 
     unsigned writes_before_install = mock.writes;
     assert(ppr_patch_run(&transport, 0x09400000U,
