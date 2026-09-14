@@ -266,9 +266,14 @@ hooks next, and redirects the ten public callers last. Removal disconnects the
 public callers before restoring the internal sites. Every mutation is verified
 immediately by exact readback. Because a transport timeout does not prove that
 A53 skipped a write, the failure path first performs a fresh exact read and
-accepts an already-applied desired value. Rollback is phase-ordered and
-verified; if the public callers cannot be confirmed stock, internal hooks are
-deliberately left intact and the payload reports `ROLLBACK_REBOOT_REQUIRED`.
+accepts an already-applied desired value. A failed install phase is attempted
+one more time. If that retry also fails, install returns an error while leaving
+verified forward progress in place; it does not roll current sites back to
+stock. A later install resumes an exactly recognized interrupted image directly
+toward the installed state and does not rewrite complete live cave code.
+Uninstall rollback remains phase-ordered and verified; if the public callers
+cannot be confirmed stock, internal hooks are deliberately left intact and the
+payload reports `ROLLBACK_REBOOT_REQUIRED`.
 The fast action preflight batches all thirteen
 current and two retired entry words in one 15-command transaction. A clean
 stock install does not read stale cave bytes which it will overwrite; caves are
@@ -305,9 +310,9 @@ selector semantics, and byte-for-byte equality of C-generated and assembled
 wrappers. Its separate KMB verifier checks the exact 20-word FsWrite context,
 DEV layout, site, stock word, and replacement branch for all 32 KMB profiles.
 
-`make host-test` exercises status, idle gating, install, interrupted-state
-recovery, uninstall, unknown-instruction rejection, and unsupported-profile
-rejection for the selector. A separate standalone test exercises KMB
+`make host-test` exercises status, idle gating, install, bounded forward retry,
+interrupted-state forward recovery, uninstall, unknown-instruction rejection,
+and unsupported-profile rejection for the selector. A separate standalone test exercises KMB
 install/uninstall, exact-layout rejection, unknown words, and readback failure.
 
 On a console, verify `--status` after a reboot and complete queue drain. Test a

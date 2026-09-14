@@ -384,6 +384,10 @@ static uint32_t access_size(uint64_t address, uint32_t length) {
     return 6;
 }
 
+static uint32_t round_up_8(uint32_t value) {
+    return (value + 7U) & ~7U;
+}
+
 static int find_mp4_device(void) {
     uint64_t bus = KERNEL_ADDRESS_BUS_DATA_DEVICES;
     if (!bus) {
@@ -915,32 +919,44 @@ static int read_memory(uint64_t address, void *destination, uint32_t size) {
 }
 
 static int write_memory(uint64_t address, const void *source, uint32_t size) {
-    struct {
+    struct scalar_write_prefix {
         struct deci5s_cmd_hdr header;
         struct { uint32_t self, total, type, pad[5], args, padding; } command;
         struct deci5s_mem_arg argument;
-    } packet;
+    };
     if (!g_initialized || !source || size == 0 ||
         size > SDBGP_MAX_WRITE_CHUNK)
         return -1;
 
-    memset(&packet, 0, sizeof(packet));
-    uint32_t total = sizeof(packet) + size;
-    initialize_outer(&packet.header, total, 1);
-    packet.command.self = sizeof(packet.command);
-    packet.command.total = sizeof(packet.command) + sizeof(packet.argument);
-    packet.command.type = SDBGP_WRITE_MEMORY;
-    packet.command.args = 1;
-    packet.argument.self_size = sizeof(packet.argument);
-    packet.argument.access_size = access_size(address, size);
-    packet.argument.mem_type = MEM_TYPE_PA_TO_EL3;
-    packet.argument.addr = address;
-    packet.argument.size = size;
-    if (total > (uint32_t)kread64(g_size_slot)) {
+    uint32_t inline_size = round_up_8(size);
+    uint32_t command_size = sizeof(((struct scalar_write_prefix *)0)->command) +
+                            sizeof(struct deci5s_mem_arg) + inline_size;
+    uint32_t total = sizeof(struct deci5s_cmd_hdr) + command_size;
+    if ((uint64_t)total > kread64(g_size_slot)) {
         puts("[!] SDBGP write packet exceeds the mailbox buffer");
         return -1;
     }
-    return send_packet(&packet.header.header, total, source, size, NULL);
+
+    uint8_t *raw = calloc(1, total);
+    if (!raw)
+        return -1;
+    struct scalar_write_prefix *packet =
+        (struct scalar_write_prefix *)raw;
+    initialize_outer(&packet->header, total, 1);
+    packet->command.self = sizeof(packet->command);
+    packet->command.total = command_size;
+    packet->command.type = SDBGP_WRITE_MEMORY;
+    packet->command.args = 1;
+    packet->argument.self_size = sizeof(packet->argument);
+    packet->argument.access_size = access_size(address, size);
+    packet->argument.mem_type = MEM_TYPE_PA_TO_EL3;
+    packet->argument.addr = address;
+    packet->argument.size = size;
+    memcpy(raw + sizeof(*packet), source, size);
+
+    int result = send_packet(&packet->header.header, total, NULL, 0, NULL);
+    free(raw);
+    return result;
 }
 
 static int locate_sdbgp_response(const uint8_t *raw, size_t raw_size,
@@ -1138,10 +1154,6 @@ static int read_many(void *context, const uint64_t *addresses,
     }
     free(raw);
     return 0;
-}
-
-static uint32_t round_up_8(uint32_t value) {
-    return (value + 7U) & ~7U;
 }
 
 static int write_many_read_many(

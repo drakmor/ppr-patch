@@ -417,47 +417,48 @@ int main(void) {
                          PPR_PATCH_INSTALL, 0) != 0);
     assert(mock.writes == writes_before_install);
 
-    /* A cave-phase failure cannot trigger writes to disconnected sites. */
+    /* A transient cave-phase failure retries forward and completes install. */
     uint64_t runtime_cave_pa =
         MOCK_SRAM_PA + RUNTIME_CAVE_VA - MOCK_IO_VA;
     mock.fail_write_once_pa = runtime_cave_pa;
     mock.fail_write_once_armed = 1;
     mock_reset_write_log(&mock);
     assert(ppr_patch_run(&transport, 0x09400000U,
-                         PPR_PATCH_INSTALL, 1) != 0);
+                         PPR_PATCH_INSTALL, 1) == 0);
     assert(!mock.fail_write_once_armed);
     assert(mock.read_many_calls == 2);
     assert(mock.read_many_count[0] == 15);
     assert(mock.read_many_count[1] == 2);
-    assert(mock.write_many_calls == 1);
-    assert(mock.write_many_count[0] == 2);
-    assert(mock.write_count == 1);
+    assert(mock.write_many_calls == 8);
+    mock_assert_pair_only(&mock);
+    assert(mock.write_count == 16);
     assert(mock.write_pa[0] == runtime_cave_pa + 0x50);
     for (size_t i = 0; i < 13; i++)
-        assert(mock_get32(&mock, mock_site_pa(i)) ==
+        assert(mock_get32(&mock, mock_site_pa(i)) !=
                (i < 10 ? call_stock[i] : internal_site_stock[i - 10]));
 
-    /* Internal-phase failure restores only the three possibly visible sites. */
+    /* A transient internal-phase failure retries forward without rollback. */
+    mock_init(&mock);
     mock.fail_write_once_pa = mock_site_pa(11);
     mock.fail_write_once_armed = 1;
     mock_reset_write_log(&mock);
     assert(ppr_patch_run(&transport, 0x09400000U,
-                         PPR_PATCH_INSTALL, 1) != 0);
+                         PPR_PATCH_INSTALL, 1) == 0);
     assert(!mock.fail_write_once_armed);
-    assert(mock.read_many_calls == 3);
+    assert(mock.read_many_calls == 2);
     assert(mock.read_many_count[0] == 15);
     assert(mock.read_many_count[1] == 2);
-    assert(mock.read_many_count[2] == 3);
-    assert(mock.write_many_calls == 2);
+    assert(mock.write_many_calls == 8);
     mock_assert_pair_only(&mock);
-    assert(mock.write_count == 6);
+    assert(mock.write_count == 16);
     for (size_t i = 0; i < 10; i++)
-        assert(mock_get32(&mock, mock_site_pa(i)) == call_stock[i]);
+        assert(mock_get32(&mock, mock_site_pa(i)) != call_stock[i]);
     for (size_t i = 0; i < 3; i++)
-        assert(mock_get32(&mock, mock_site_pa(10 + i)) ==
+        assert(mock_get32(&mock, mock_site_pa(10 + i)) !=
                internal_site_stock[i]);
     mock_assert_no_legacy_writes(&mock);
 
+    mock_init(&mock);
     mock_reset_write_log(&mock);
     assert(ppr_patch_run(&transport, 0x09400000U,
                          PPR_PATCH_INSTALL, 1) == 0);
@@ -482,8 +483,9 @@ int main(void) {
     assert(mock.read_many_calls == 2);
     assert(mock.read_many_count[0] == 15);
     assert(mock.read_many_count[1] == 2);
-    assert(mock.write_many_calls == 13);
+    assert(mock.write_many_calls == 6);
     mock_assert_pair_only(&mock);
+    assert(mock.write_count == 13);
     assert(mock_get32(&mock, mock_site_pa(4)) != call_stock[4]);
     assert(mock_get32(&mock, mock_site_pa(11)) != internal_site_stock[1]);
 
@@ -595,38 +597,48 @@ int main(void) {
     assert(mock.read_many_count[1] == 2);
     mock_put32(&mock, mock_site_pa(0), call_stock[0]);
 
-    /* A failed native-to-current connect rolls back current sites only. */
+    /* A transient public connect failure retries forward and completes. */
     mock.fail_write_once_pa = mock_site_pa(4);
     mock.fail_write_once_armed = 1;
     mock_reset_write_log(&mock);
     assert(ppr_patch_run(&transport, 0x09400000U,
-                         PPR_PATCH_INSTALL, 1) != 0);
+                         PPR_PATCH_INSTALL, 1) == 0);
     assert(!mock.fail_write_once_armed);
-    assert(mock.read_many_calls == 4);
+    assert(mock.read_many_calls == 2);
     assert(mock.read_many_count[0] == 15);
     assert(mock.read_many_count[1] == 2);
-    assert(mock.read_many_count[2] == 10);
-    assert(mock.read_many_count[3] == 3);
-    assert(mock.write_many_calls == 5);
+    assert(mock.write_many_calls == 10);
     mock_assert_pair_only(&mock);
-    assert(mock.write_count == 22);
+    assert(mock.write_count == 19);
     assert(mock.write_pa[0] ==
            MOCK_SRAM_PA + RUNTIME_CAVE_VA + 0x50 - MOCK_IO_VA);
     assert(mock.write_pa[1] ==
            MOCK_SRAM_PA + RUNTIME_CAVE_VA - MOCK_IO_VA);
-    for (size_t i = 0; i < 3; i++)
-        assert(mock.write_pa[2 + i] == mock_site_pa(10 + i));
-    for (size_t i = 0; i < 4; i++)
-        assert(mock.write_pa[5 + i] == mock_site_pa(i));
-    mock_assert_current_restore_sequence(&mock, 9);
     mock_assert_no_legacy_writes(&mock);
     for (size_t i = 0; i < 10; i++)
-        assert(mock_get32(&mock, mock_site_pa(i)) == call_stock[i]);
+        assert(mock_get32(&mock, mock_site_pa(i)) != call_stock[i]);
     for (size_t i = 0; i < 3; i++)
-        assert(mock_get32(&mock, mock_site_pa(10 + i)) ==
+        assert(mock_get32(&mock, mock_site_pa(10 + i)) !=
                internal_site_stock[i]);
 
+    /* A persistent install failure stops after the bounded retry and keeps
+     * already-connected forward state instead of rolling it back to stock. */
+    mock_init(&mock);
+    mock.fail_write_always_pa = mock_site_pa(4);
+    mock.fail_read_after_write_failure = 1;
+    mock_reset_write_log(&mock);
+    assert(ppr_patch_run(&transport, 0x09400000U,
+                         PPR_PATCH_INSTALL, 1) != 0);
+    for (size_t i = 0; i < 4; i++)
+        assert(mock_get32(&mock, mock_site_pa(i)) != call_stock[i]);
+    assert(mock_get32(&mock, mock_site_pa(4)) == call_stock[4]);
+    for (size_t i = 0; i < 3; i++)
+        assert(mock_get32(&mock, mock_site_pa(10 + i)) !=
+               internal_site_stock[i]);
+    mock_assert_no_legacy_writes(&mock);
+
     /* Unknown retired code is never overwritten. */
+    mock_init(&mock);
     mock_put32(&mock, mock_legacy_site_pa(0), 0xdeadbeefU);
     mock_reset_write_log(&mock);
     assert(ppr_patch_run(&transport, 0x09400000U,

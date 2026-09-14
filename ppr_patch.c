@@ -17,6 +17,7 @@
 #define PPR_LAYOUT_IO_FIXED_INDEX_OFF 0x54U
 #define PPR_LAYOUT_IO_DEV_INDEX_OFF 0x74U
 #define PPR_MIXED_WRITE_MAX 8U
+#define PPR_INSTALL_MAX_ATTEMPTS 2U
 
 struct ppr_layout_record {
     uint32_t id;
@@ -914,7 +915,7 @@ static int ppr_write_many_checked(
 
     /* A timeout means "completion unknown", not "the write did not run".
      * Reopen the transport and reconcile the intended bytes before deciding
-     * whether this phase needs rollback. */
+     * whether this phase needs retry or failure handling. */
     if (ppr_verify_expected_many(ctx, addresses, sources, sizes, names,
                                  count) == 0) {
         ppr_logf(ctx,
@@ -1029,6 +1030,44 @@ static int ppr_write_sites(const struct ppr_context *ctx,
             return -1;
     }
     return 0;
+}
+
+static int ppr_install_caves_with_retry(
+        const struct ppr_context *ctx, const struct ppr_resolved *resolved) {
+    for (unsigned attempt = 1; attempt <= PPR_INSTALL_MAX_ATTEMPTS;
+         attempt++) {
+        if (ppr_write_pair_checked(
+                ctx, resolved->plaintext_cave, ctx->images.plaintext,
+                PPR_PLAINTEXT_SIZE, "plaintext executable-tail cave",
+                resolved->runtime_cave, ctx->images.runtime,
+                PPR_RUNTIME_SIZE, "runtime executable-tail cave") == 0)
+            return 0;
+        if (attempt < PPR_INSTALL_MAX_ATTEMPTS)
+            ppr_logf(ctx,
+                     "[!] dormant cave install attempt %u failed; retrying",
+                     attempt);
+    }
+    ppr_logf(ctx,
+             "[!] dormant cave install failed after %u attempts; no entry hooks were connected",
+             PPR_INSTALL_MAX_ATTEMPTS);
+    return -1;
+}
+
+static int ppr_install_sites_with_retry(
+        const struct ppr_context *ctx, const struct ppr_resolved *resolved,
+        size_t first, size_t end, const char *phase) {
+    for (unsigned attempt = 1; attempt <= PPR_INSTALL_MAX_ATTEMPTS;
+         attempt++) {
+        if (ppr_write_sites(ctx, resolved, first, end, 1) == 0)
+            return 0;
+        if (attempt < PPR_INSTALL_MAX_ATTEMPTS)
+            ppr_logf(ctx, "[!] %s install attempt %u failed; retrying",
+                     phase, attempt);
+    }
+    ppr_logf(ctx,
+             "[!] %s install failed after %u attempts; leaving forward progress in place for a later install retry",
+             phase, PPR_INSTALL_MAX_ATTEMPTS);
+    return -1;
 }
 
 static int ppr_restore_stock_checked(const struct ppr_context *ctx,
@@ -1193,40 +1232,28 @@ int ppr_patch_run_target(const struct ppr_patch_transport *transport,
             ppr_logf(&ctx, "[!] install refused: exact stock or recoverable signatures are required");
             return -1;
         }
-        if (before.recoverable) {
-            ppr_logf(&ctx, "[*] restoring exact current entry points before retry");
-            if (ppr_restore_stock_checked(&ctx, &resolved) != 0) {
-                ppr_logf(&ctx, "[!] exact stock recovery write failed; applying ordered best-effort rollback");
-                (void)ppr_restore_stock_best_effort(&ctx, &resolved);
-                return -1;
-            }
-        }
+        if (before.recoverable)
+            ppr_logf(&ctx,
+                     "[*] resuming recognized interrupted install without stock rollback");
 
-        /* Build dormant code first, then connect control-flow sites.  Roll
-         * back only phases which may already be visible; a failed cave write
-         * cannot require thirteen unnecessary entry-site transactions. */
-        if (ppr_write_pair_checked(
-                &ctx, resolved.plaintext_cave, ctx.images.plaintext,
-                PPR_PLAINTEXT_SIZE, "plaintext executable-tail cave",
-                resolved.runtime_cave, ctx.images.runtime,
-                PPR_RUNTIME_SIZE, "runtime executable-tail cave") != 0) {
-            ppr_logf(&ctx, "[!] dormant cave install failed; no entry hooks were connected");
+        /* A native image has no connected current hooks, so its caves can be
+         * installed and retried safely.  A recoverable image already has the
+         * exact cave bytes and may have live public callers; do not rewrite
+         * executable code underneath them. */
+        if (before.native &&
+            ppr_install_caves_with_retry(&ctx, &resolved) != 0)
             return -1;
-        }
-        if (ppr_write_sites(&ctx, &resolved, PPR_CALL_COUNT,
-                            PPR_SITE_COUNT, 1) != 0) {
-            ppr_logf(&ctx, "[!] internal-hook install failed; restoring only internal sites");
-            if (ppr_restore_site_range_best_effort(
-                    &ctx, &resolved, PPR_CALL_COUNT, PPR_SITE_COUNT) != 0)
-                ppr_logf(&ctx,
-                         "[!] ROLLBACK_REBOOT_REQUIRED: internal install rollback is unconfirmed");
+
+        /* Connect internal helpers before public callers.  A failed phase is
+         * retried forward; install never rolls already-applied sites to stock. */
+        if (ppr_install_sites_with_retry(
+                &ctx, &resolved, PPR_CALL_COUNT, PPR_SITE_COUNT,
+                "internal-hook") != 0)
             return -1;
-        }
-        if (ppr_write_sites(&ctx, &resolved, 0, PPR_CALL_COUNT, 1) != 0) {
-            ppr_logf(&ctx, "[!] public-hook install failed; attempting ordered stock rollback");
-            (void)ppr_restore_stock_best_effort(&ctx, &resolved);
+        if (ppr_install_sites_with_retry(
+                &ctx, &resolved, 0, PPR_CALL_COUNT,
+                "public-hook") != 0)
             return -1;
-        }
     } else {
         if (before.native) {
             ppr_logf(&ctx, "[+] patch is already absent");
